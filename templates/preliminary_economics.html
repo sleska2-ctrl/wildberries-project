@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Предварительная экономика по заказам</title>
+    <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+    <h1>Предварительная экономика по заказам</h1>
+    <form method="get">
+        <label for="article">Артикул:</label>
+        <input type="text" id="article" name="article" value="{{ article_query }}">
+
+        <label for="date_from">Период с:</label>
+        <input type="date" id="date_from" name="date_from" value="{{ date_from }}">
+
+        <label for="date_to">Период по:</label>
+        <input type="date" id="date_to" name="date_to" value="{{ date_to }}">
+
+        <button type="submit">Показать</button>
+    </form>
+
+    <table border="1">
+        <thead>
+            <tr>
+                <th>Артикул / SKU</th>
+                <th>Дата</th>
+                <th>Количество заказов</th>
+                <th>Сумма заказов</th>
+                <th>Комиссия, ₽</th>
+                <th>Эквайринг, ₽</th>
+                <th>Реклама, ₽</th>
+                <th>Дополнительные расходы, ₽</th>
+                <th>Предварительная прибыль, ₽</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for row in data %}
+            <tr>
+                <td>{{ row['sku'] }}</td>
+                <td>{{ row['date'] }}</td>
+                <td>{{ row['orders_count'] }}</td>
+                <td>{{ row['orders_sum'] }}</td>
+                <td>{{ row['commission'] }}</td>
+                <td>{{ row['acquiring'] }}</td>
+                <td>{{ row['advertising'] }}</td>
+                <td>{{ row['additional_expenses'] }}</td>
+                <td>{{ row['preliminary_profit'] }}</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</body>
+</html>
