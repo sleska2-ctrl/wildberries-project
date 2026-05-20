@@ -1688,13 +1688,13 @@ BUYOUT_ORDER_DAY_HTML = """\
     .chart-swatch {{ width: 10px; height: 10px; border-radius: 999px; flex: 0 0 auto; }}
     .chart-empty {{ color: var(--muted); font-size: .78rem; padding: 14px 0 4px; }}
     .chart-svg-wrap {{ position: relative; width: 100%; overflow-x: auto; border: 1px solid #eef2f7; border-radius: 10px; background: linear-gradient(180deg, #fcfffe, #f8fafc); }}
-    .chart-svg {{ display: block; min-width: 980px; width: 100%; height: 860px; }}
+    .chart-svg {{ display: block; min-width: var(--chart-min-width, 980px); width: 100%; height: var(--chart-height, 860px); }}
     .chart-axis {{ stroke: #cbd5e1; stroke-width: 1; }}
     .chart-grid {{ stroke: #e5e7eb; stroke-width: 1; stroke-dasharray: 3 4; }}
-    .chart-label {{ fill: #64748b; font-size: 11px; }}
-    .chart-zone-label {{ fill: #0f766e; font-size: 12px; font-weight: 700; }}
-    .chart-line {{ fill: none; stroke-width: 2.5; stroke-linecap: round; stroke-linejoin: round; }}
-    .chart-dot {{ stroke: #fff; stroke-width: 1.5; }}
+    .chart-label {{ fill: #64748b; font-size: var(--chart-font-size, 11px); }}
+    .chart-zone-label {{ fill: #0f766e; font-size: var(--chart-zone-font-size, 12px); font-weight: 700; }}
+    .chart-line {{ fill: none; stroke-width: var(--chart-line-width, 2.5); stroke-linecap: round; stroke-linejoin: round; }}
+    .chart-dot {{ stroke: #fff; stroke-width: var(--chart-dot-stroke, 1.5); }}
     .chart-hover-line {{ stroke: #0f766e; stroke-width: 1.5; stroke-dasharray: 4 4; opacity: .55; }}
     .chart-hit {{ fill: transparent; cursor: crosshair; }}
     .chart-tooltip {{ position: absolute; display: none; min-width: 180px; max-width: 280px; padding: 8px 10px; border: 1px solid #99f6e4; border-radius: 10px; background: rgba(255, 255, 255, .96); box-shadow: 0 14px 28px rgba(15, 118, 110, .16); color: #0f172a; font-size: 12px; line-height: 1.35; pointer-events: none; }}
@@ -1810,6 +1810,7 @@ let activeChartMetrics = new Set();
 let latestChartPayload = null;
 let articlesCollapsed = false;
 let collapsedGroups = new Set();
+let chartMetricsInitialized = false;
 const chartPalette = ['#0f766e', '#f97316', '#0284c7', '#dc2626', '#7c3aed', '#16a34a', '#ca8a04', '#db2777', '#0891b2', '#4f46e5'];
 
 function syncArticlesPanel() {{
@@ -1831,7 +1832,10 @@ function restoreFilters() {{
     if (saved.dt) document.getElementById('dt').value = saved.dt;
     if (saved.subject !== undefined) subjectEl.dataset.pendingValue = saved.subject;
     if (Array.isArray(saved.selectedArticles)) selectedArticles = new Set(saved.selectedArticles.map(String).filter(value => /^\d+$/.test(value)));
-    if (Array.isArray(saved.chartMetrics)) activeChartMetrics = new Set(saved.chartMetrics);
+    if (Array.isArray(saved.chartMetrics)) {{
+      activeChartMetrics = new Set(saved.chartMetrics);
+      chartMetricsInitialized = true;
+    }}
     if (Array.isArray(saved.collapsedGroups)) collapsedGroups = new Set(saved.collapsedGroups.map(String).filter(Boolean));
     articlesCollapsed = Boolean(saved.articlesCollapsed);
   }} catch (err) {{}}
@@ -1901,7 +1905,7 @@ function chartRowsFromPayload(data) {{
 }}
 
 function ensureDefaultChartMetrics(rows) {{
-  if (activeChartMetrics.size) return;
+  if (chartMetricsInitialized || activeChartMetrics.size) return;
   const defaults = [
     'Сумма заказов',
     'Сумма выкупов в эту дату',
@@ -1916,6 +1920,7 @@ function ensureDefaultChartMetrics(rows) {{
   if (!activeChartMetrics.size) {{
     for (const row of rows.slice(0, 4)) activeChartMetrics.add(row.metric);
   }}
+  chartMetricsInitialized = true;
 }}
 
 function renderChart(data) {{
@@ -1929,6 +1934,40 @@ function renderChart(data) {{
     return;
   }}
 
+  const isWeekChart = reportGranularity === 'week';
+  const chartConfig = isWeekChart
+    ? {{
+        minWidth: Math.max(840, dates.length * 150 + 260),
+        height: 760,
+        left: 74,
+        right: 26,
+        top: 30,
+        bottom: 112,
+        gap: 44,
+        moneyHeight: 390,
+        percentHeight: 184,
+        fontSize: 12,
+        zoneFontSize: 13,
+        lineWidth: 3.2,
+        dotStroke: 1.8,
+        dotRadius: 4.8,
+      }}
+    : {{
+        minWidth: Math.max(980, dates.length * 84 + 220),
+        height: 860,
+        left: 64,
+        right: 18,
+        top: 24,
+        bottom: 110,
+        gap: 52,
+        moneyHeight: 450,
+        percentHeight: 220,
+        fontSize: 11,
+        zoneFontSize: 12,
+        lineWidth: 2.5,
+        dotStroke: 1.5,
+        dotRadius: 3.5,
+      }};
   const percentRows = selectedRows.filter(row => String(row.kind || '').startsWith('percent'));
   const moneyRows = selectedRows.filter(row => !String(row.kind || '').startsWith('percent'));
   const moneySeries = moneyRows.map(row => row.values.map(parseMetricValue));
@@ -1936,16 +1975,16 @@ function renderChart(data) {{
   const moneyMax = Math.max(0, ...moneySeries.flat());
   const percentMax = Math.max(0, ...percentSeries.flat());
 
-  const width = Math.max(980, dates.length * 84 + 220);
-  const height = 860;
-  const left = 64;
-  const right = 18;
-  const top = 24;
-  const bottom = 110;
-  const gap = 52;
+  const width = chartConfig.minWidth;
+  const height = chartConfig.height;
+  const left = chartConfig.left;
+  const right = chartConfig.right;
+  const top = chartConfig.top;
+  const bottom = chartConfig.bottom;
+  const gap = chartConfig.gap;
   const plotWidth = width - left - right;
-  const moneyHeight = 450;
-  const percentHeight = 220;
+  const moneyHeight = chartConfig.moneyHeight;
+  const percentHeight = chartConfig.percentHeight;
   const moneyTop = top;
   const percentTop = moneyTop + moneyHeight + gap;
   const moneyBottom = moneyTop + moneyHeight;
@@ -2009,7 +2048,7 @@ function renderChart(data) {{
     const dots = values.map((value, pointIdx) => {{
       const x = left + xStep * pointIdx;
       const y = zoneBottom - value * scale;
-      return `<circle class="chart-dot" cx="${{x}}" cy="${{y}}" r="3.5" fill="${{color}}"><title>${{escapeHtml(row.metric)}}: ${{row.values[pointIdx]}}</title></circle>`;
+      return `<circle class="chart-dot" cx="${{x}}" cy="${{y}}" r="${{chartConfig.dotRadius}}" fill="${{color}}"><title>${{escapeHtml(row.metric)}}: ${{row.values[pointIdx]}}</title></circle>`;
     }}).join('');
     const labelX = width - right - 8;
     const lastValue = values[values.length - 1] || 0;
@@ -2028,6 +2067,12 @@ function renderChart(data) {{
     return `<rect class="chart-hit" data-index="${{idx}}" x="${{rectX}}" y="${{moneyTop}}" width="${{rectWidth}}" height="${{percentBottom - moneyTop}}"></rect>`;
   }}).join('');
 
+  chartWrap.style.setProperty('--chart-min-width', `${{width}}px`);
+  chartWrap.style.setProperty('--chart-height', `${{height}}px`);
+  chartWrap.style.setProperty('--chart-font-size', `${{chartConfig.fontSize}}px`);
+  chartWrap.style.setProperty('--chart-zone-font-size', `${{chartConfig.zoneFontSize}}px`);
+  chartWrap.style.setProperty('--chart-line-width', `${{chartConfig.lineWidth}}`);
+  chartWrap.style.setProperty('--chart-dot-stroke', `${{chartConfig.dotStroke}}`);
   chartWrap.innerHTML = `
     <div class="chart-tooltip" id="chart-tooltip"></div>
     <svg class="chart-svg" viewBox="0 0 ${{width}} ${{height}}" preserveAspectRatio="none">
@@ -2209,6 +2254,7 @@ function render(data) {{
       const metric = input.dataset.metric;
       if (input.checked) activeChartMetrics.add(metric);
       else activeChartMetrics.delete(metric);
+      chartMetricsInitialized = true;
       saveFilters();
       renderChart(data);
     }});
@@ -2271,11 +2317,19 @@ function renderArticles(articles) {{
 	      if (event.shiftKey && lastArticleIndex >= 0) {{
 	        const [from, to] = [lastArticleIndex, idx].sort((a, b) => a - b);
 	        for (let pos = from; pos <= to; pos++) selectedArticles.add(String(articleItems[pos].nmid || articleItems[pos].article || '').trim());
-      }} else if (selectedArticles.has(article)) {{
-        selectedArticles.delete(article);
+      }} else if (event.ctrlKey || event.metaKey) {{
+        if (selectedArticles.has(article)) {{
+          selectedArticles.delete(article);
+        }} else {{
+          selectedArticles.add(article);
+        }}
         lastArticleIndex = idx;
       }} else {{
-        selectedArticles.add(article);
+        if (selectedArticles.has(article) && selectedArticles.size === 1) {{
+          selectedArticles.clear();
+        }} else {{
+          selectedArticles = new Set([article]);
+        }}
         lastArticleIndex = idx;
       }}
       saveFilters();
