@@ -1,4 +1,4 @@
-# Wildberries Google Sheets Sync: Technical Notes
+# Wildberries Analytics Sync: Technical Notes
 
 Этот файл - рабочая техническая памятка по проекту. Он нужен, чтобы быстро понимать архитектуру, точки входа, потоки данных и осторожные места перед будущими правками.
 
@@ -6,14 +6,16 @@
 
 ## Назначение
 
-Проект синхронизирует данные Wildberries в Google Sheets:
+Проект синхронизирует данные Wildberries в локальную SQLite-базу и показывает аналитику через web UI. Google Sheets больше не используются в основном рабочем процессе из-за низкой производительности на больших объемах данных; оставшиеся Google Sheets-модули и скрипты считаются legacy.
+
+Проект собирает:
 
 - продажи и финансовый отчет WB;
 - заказы WB;
 - рекламную статистику;
 - воронку продаж;
 - агрегированный `daily_pnl`;
-- вспомогательные дашборды и сводные листы в Google Sheets.
+- вспомогательные дашборды и сводные таблицы в SQLite/web UI.
 
 Есть два основных интерфейса:
 
@@ -24,16 +26,16 @@
 
 - Python 3.13 в Dockerfile.
 - HTTP-клиент: `requests`.
-- Google Sheets API: `google-api-python-client`, `google-auth`.
+- Google Sheets API: `google-api-python-client`, `google-auth` только для legacy-сценариев.
 - Конфиг из `.env`: `python-dotenv`.
 - Веб-интерфейс на стандартной библиотеке: `http.server.ThreadingHTTPServer`, Server-Sent Events для логов.
 
 ## Структура
 
 - `src/wb_gsheets/config.py` - загрузка настроек из окружения.
-- `src/wb_gsheets/main.py` - основной сценарий синхронизации WB -> Google Sheets.
+- `src/wb_gsheets/main.py` - основной сценарий синхронизации WB -> SQLite.
 - `src/wb_gsheets/wb_client.py` - клиент Wildberries API.
-- `src/wb_gsheets/google_sheets.py` - клиент Google Sheets, создание листов, replace/upsert.
+- `src/wb_gsheets/google_sheets.py` - legacy-клиент Google Sheets.
 - `src/wb_gsheets/transform.py` - фильтрация, маппинг, агрегация PnL, подготовка строк для Sheets.
 - `src/wb_gsheets/utils.py` - Decimal, даты, chunk/window helpers.
 - `web_app.py` - локальный веб-интерфейс запуска синхронизации с live-логом.
@@ -46,14 +48,13 @@
 
 Обязательные переменные:
 
-- `GOOGLE_SERVICE_ACCOUNT_FILE` - путь к JSON сервисного аккаунта.
-- `GOOGLE_SPREADSHEET_ID` - id Google Spreadsheet.
 - `DEFAULT_DATE_FROM`, `DEFAULT_DATE_TO` - даты по умолчанию для CLI.
 - `WB_FINANCE_TOKEN` или общий `WB_API_TOKEN`.
 - `WB_ADV_TOKEN` или общий `WB_API_TOKEN`.
 
 Опциональные переменные:
 
+- `GOOGLE_SERVICE_ACCOUNT_FILE`, `GOOGLE_SPREADSHEET_ID` - legacy-настройки Google Sheets; для штатного SQLite/web UI не нужны.
 - `GOOGLE_RAW_SALES_SHEET`, по умолчанию `raw_sales`.
 - `GOOGLE_RAW_ORDERS_SHEET`, по умолчанию `raw_orders`.
 - `GOOGLE_RAW_ADS_SHEET`, по умолчанию `raw_ads`.
@@ -71,8 +72,8 @@
 `src/wb_gsheets/main.py`:
 
 1. Читает настройки и даты.
-2. Создает `WildberriesClient` и `GoogleSheetsClient`.
-3. Читает лист `SKU`/COGS из Google Sheets.
+2. Создает `WildberriesClient` и `SQLiteStore`.
+3. Читает `SKU`/COGS из SQLite. Legacy fallback может прочитать SKU из Google Sheets, если SQLite пустая и явно заданы Google-настройки.
 4. Получает фильтры артикулов:
    - `ARTICLE_FILTER_VALUES`, если заданы;
    - иначе значения из `SKU` через `extract_filter_values`.
@@ -111,7 +112,9 @@
 
 ## Google Sheets
 
-`GoogleSheetsClient` умеет:
+Google Sheets больше не являются рабочим хранилищем проекта. От них отказались из-за низкой производительности, поэтому актуальная схема - SQLite + web UI.
+
+`GoogleSheetsClient` оставлен для legacy-сценариев и умеет:
 
 - создавать лист, если его нет: `ensure_sheet`;
 - полностью пересоздавать лист: `recreate_sheet`;
@@ -278,7 +281,7 @@ PYTHONPATH=src python scripts/build_management_viz.py
 ## Осторожные места
 
 - В корне проекта нет `.git`, поэтому перед крупными изменениями лучше вручную проверять, какие файлы меняются.
-- В проекте есть `secrets/google-service-account.json`; не печатать и не коммитить секреты.
+- Реальные Google service-account ключи не должны храниться в проекте. Каталог `secrets/` игнорируется git и подходит только для локальных временных секретов.
 - `__pycache__` сейчас лежат в дереве проекта, но не являются исходниками.
 - API рекламы медленный из-за лимитов и `sleep(20)`.
 - `raw_sales` и `raw_orders` пишутся append/upsert-логикой; повторные запуски не должны дублировать строки при корректных ключах.
