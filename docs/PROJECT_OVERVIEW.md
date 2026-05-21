@@ -1,0 +1,464 @@
+# Документация проекта Wildberries Analytics
+
+## Назначение
+
+Проект собирает данные кабинета Wildberries, сохраняет их в локальную SQLite-базу и строит аналитические таблицы для управленческих отчетов. Основной сценарий запускается из CLI или из локального веб-интерфейса.
+
+Текущая основная цепочка:
+
+1. Получить справочник SKU и себестоимости.
+2. Забрать данные Wildberries за выбранный период.
+3. Нормализовать ответы API в табличный формат.
+4. Сохранить сырые таблицы в SQLite без дублей по ключам.
+5. Пересчитать производные финансовые и операционные таблицы.
+6. Показать результаты в веб-интерфейсе или, для отдельных legacy-скриптов, выгрузить листы в Google Sheets.
+
+## Стек
+
+- Python 3.13.
+- `requests` для HTTP-запросов к API Wildberries.
+- `sqlite3` из стандартной библиотеки для локального хранилища.
+- `python-dotenv` для загрузки `.env`.
+- `openpyxl` для чтения внешнего XLSX-файла SKU.
+- `google-api-python-client` и `google-auth` для чтения/записи Google Sheets в вспомогательных сценариях.
+- `http.server.ThreadingHTTPServer` для встроенного веб-интерфейса.
+- Server-Sent Events в веб-интерфейсе для потоковой передачи логов синхронизации.
+- Docker и Docker Compose для серверного запуска веб-интерфейса.
+
+## Основные файлы
+
+- `src/wb_gsheets/main.py` - главный сценарий синхронизации.
+- `src/wb_gsheets/config.py` - загрузка переменных окружения.
+- `src/wb_gsheets/wb_client.py` - клиент API Wildberries.
+- `src/wb_gsheets/sqlite_store.py` - слой записи и чтения SQLite.
+- `src/wb_gsheets/transform.py` - нормализация, маппинги, расчет `daily_pnl`, расчет выкупов.
+- `src/wb_gsheets/analytics.py` - построение управленческих аналитических таблиц.
+- `src/wb_gsheets/google_sheets.py` - клиент Google Sheets для чтения SKU и legacy-выгрузок.
+- `web_app.py` - локальный веб-интерфейс запуска синхронизации и просмотра отчетов.
+- `run_sync.py` - тонкая обертка над `wb_gsheets.main`.
+- `scripts/*.py` - вспомогательные скрипты для Google Sheets-дашбордов и формульных листов.
+- `scripts/*.sh` - запуск, остановка, автозапуск, cron и деплой.
+- `Dockerfile`, `docker-compose.yml` - контейнерный запуск.
+- `.env.example` - пример переменных окружения.
+- `TECHNICAL.md` - рабочие технические заметки и осторожные места.
+
+## Конфигурация
+
+Настройки читаются из `.env`.
+
+Обязательные переменные:
+
+- `WB_FINANCE_TOKEN` или общий `WB_API_TOKEN` - токен для finance/statistics/analytics API.
+- `WB_ADV_TOKEN` или общий `WB_API_TOKEN` - токен для advertising API.
+- `DEFAULT_DATE_FROM` - дата начала периода по умолчанию.
+- `DEFAULT_DATE_TO` - дата окончания периода по умолчанию.
+
+Переменные для Google Sheets:
+
+- `GOOGLE_SERVICE_ACCOUNT_FILE` - путь к JSON сервисного аккаунта.
+- `GOOGLE_SPREADSHEET_ID` - id Google Spreadsheet.
+- `GOOGLE_COGS_SHEET` - лист справочника SKU, по умолчанию `SKU`.
+- `GOOGLE_RAW_SALES_SHEET` - имя таблицы продаж, по умолчанию `raw_sales`.
+- `GOOGLE_RAW_ORDERS_SHEET` - имя таблицы заказов, по умолчанию `raw_orders`.
+- `GOOGLE_RAW_ADS_SHEET` - имя таблицы рекламы, по умолчанию `raw_ads`.
+- `GOOGLE_DAILY_PNL_SHEET` - имя таблицы PnL, по умолчанию `daily_pnl`.
+- `GOOGLE_FUNNEL_ANALYTICS_SHEET` - имя таблицы воронки, по умолчанию `funnel_analytics`.
+
+Переменные локального хранилища и web UI:
+
+- `SQLITE_DB_PATH` - путь к SQLite, по умолчанию `data/wb_sync.db`.
+- `WB_SITE_PASSWORD` - пароль web UI, если задан.
+- `WEB_PUBLIC_PORT` - внешний порт Docker Compose, по умолчанию `80`.
+
+Фильтрация артикулов:
+
+- `ARTICLE_FILTER_TYPE` - тип артикула для расчетов, `nmId` или `vendorCode`, по умолчанию `nmId`.
+- `ARTICLE_FILTER_VALUES` - CSV-список артикулов. Если пустой, значения берутся из листа/таблицы `SKU`.
+
+Важно: в текущем основном сценарии продажи и заказы сохраняются по полному кабинету. Фильтры и SKU используются прежде всего для маппинга, себестоимости, признака "наши/не наши" и построения отчетов.
+
+## Источники данных
+
+### Wildberries Finance API
+
+Метод в коде: `WildberriesClient.fetch_sales_details`.
+
+Источник: `https://finance-api.wildberries.ru/api/finance/v1/sales-reports/detailed`.
+
+Что собирается:
+
+- финансовый отчет продаж;
+- продажи и возвраты;
+- суммы продаж;
+- комиссии, эквайринг, логистика;
+- хранение, приемка, штрафы, удержания, доплаты;
+- сумма к перечислению `forPay`;
+- связь продажи с датой заказа через `orderDt`.
+
+Данные сохраняются в таблицу `raw_sales`. Ключ upsert: `rrdId`.
+
+### Wildberries Statistics API: заказы
+
+Метод в коде: `WildberriesClient.fetch_orders`.
+
+Источник: `https://statistics-api.wildberries.ru/api/v1/supplier/orders`.
+
+Что собирается:
+
+- поток заказов;
+- дата заказа и дата изменения;
+- склад, регион, страна;
+- `supplierArticle`, `nmId`, barcode;
+- цена, скидка, отмена, идентификаторы заказа.
+
+Данные сохраняются в таблицу `raw_orders`. Ключ upsert: `srid`.
+
+### Wildberries Statistics API: остатки
+
+Метод в коде: `WildberriesClient.fetch_stocks`.
+
+Источник: `https://statistics-api.wildberries.ru/api/v1/supplier/stocks`.
+
+Что собирается:
+
+- текущие остатки по складам;
+- количество на складе и в пути;
+- `supplierArticle`, `nmId`, barcode;
+- категория, предмет, бренд, размер;
+- цена и скидка.
+
+Данные сохраняются в таблицу `raw_stocks`. Таблица каждый раз заменяется полностью.
+
+### Wildberries Advertising API
+
+Методы в коде:
+
+- `fetch_campaign_ids`;
+- `fetch_campaign_details`;
+- `fetch_relevant_campaign_ids`;
+- `fetch_campaign_stats`.
+
+Источники:
+
+- `https://advert-api.wildberries.ru/adv/v1/promotion/count`;
+- `https://advert-api.wildberries.ru/api/advert/v2/adverts`;
+- `https://advert-api.wildberries.ru/adv/v3/fullstats`.
+
+Что собирается:
+
+- активные, приостановленные и завершенные рекламные кампании со статусами `7`, `9`, `11`;
+- состав кампаний и связанные `nmId`;
+- дневная статистика рекламы по товарам: показы, клики, расходы, заказы, сумма заказов.
+
+Данные разворачиваются функцией `flatten_ads_rows` и сохраняются в `raw_ads`. Ключ upsert: `date`, `advertId`, `appType`, `nmId`.
+
+### Wildberries Analytics API: воронка
+
+Метод в коде: `WildberriesClient.fetch_funnel_history`.
+
+Источник: `https://seller-analytics-api.wildberries.ru/api/analytics/v3/sales-funnel/products/history`.
+
+Что собирается:
+
+- история воронки по `nmId`;
+- сумма и количество заказов;
+- количество и сумма выкупов;
+- отмены;
+- данные по дням.
+
+Данные сохраняются в `funnel_analytics`. Ключ upsert: `date`, `nmId`.
+
+### Справочник SKU и себестоимости
+
+Источники:
+
+- локальная таблица SQLite `SKU`/`sku`;
+- если локально пусто, лист Google Sheets `GOOGLE_COGS_SHEET`;
+- внешний файл `data/sku_iitech.xlsx`, если он существует.
+
+Использование:
+
+- маппинг `nmId -> supplierArticle` или внутренний артикул;
+- себестоимость для PnL;
+- признак `ИИТех` для деления товаров на "наши" и "не наши";
+- обогащение SKU полями `Предмет`, `Артикул поставщика`, `НАШ`, `Название`, `себестоимость`, `% комиссии на вб`.
+
+Поддерживаемые заголовки для WB-артикула:
+
+- `Артикул WB`;
+- `nmId`;
+- `nm_id`.
+
+Поддерживаемые заголовки для артикула поставщика:
+
+- `Артикул поставщика`;
+- `НАШ`;
+- `supplierArticle`;
+- `SKU`;
+- `sku`.
+
+Поддерживаемые заголовки себестоимости:
+
+- `cogs`;
+- `себестоимость`;
+- `cost_price`.
+
+## Типовая последовательность полной синхронизации
+
+Запуск:
+
+```bash
+PYTHONPATH=src python -m wb_gsheets.main --date-from 2026-05-01 --date-to 2026-05-07
+```
+
+Последовательность внутри `main.py`:
+
+1. Разбираются CLI-аргументы: даты, `--only`, `--skip-ads`, `--skip-funnel`.
+2. Загружается конфигурация из `.env`.
+3. Создаются клиенты `WildberriesClient` и `SQLiteStore`.
+4. Справочник SKU читается из SQLite.
+5. Если в SQLite нет SKU и заданы настройки Google Sheets, справочник читается из Google Sheets.
+6. Если есть `data/sku_iitech.xlsx`, справочник SKU обогащается данными из XLSX.
+7. SKU сохраняется в SQLite.
+8. Строится маппинг `nmId -> article`.
+9. Загружается финансовый отчет продаж за период.
+10. Загружаются заказы с `date_from`.
+11. Загружаются текущие остатки.
+12. Если реклама не отключена, собирается список `nmId`, ищутся связанные рекламные кампании и грузится статистика рекламы.
+13. Считается `daily_pnl`.
+14. Считаются аналитические таблицы из `analytics.py`.
+15. Сырые таблицы `raw_sales`, `raw_orders`, `raw_ads`, `raw_stocks` сохраняются в SQLite.
+16. `daily_pnl` сохраняется в SQLite.
+17. Если воронка не отключена, загружается `funnel_analytics`.
+18. Воронка из API дополняется уже сохраненными строками из SQLite, чтобы старые даты не пропадали из расчетов.
+19. Пересобирается `buyout_order_day`.
+20. Обновляются производные таблицы:
+    - `finance_article_day_detail`;
+    - `analytics_article_day`;
+    - `analytics_day`;
+    - `analytics_article_period`.
+
+## Частичная синхронизация
+
+Параметр `--only` позволяет загрузить только один тип данных, а затем пересчитать производные таблицы из SQLite.
+
+Доступные режимы:
+
+- `--only sales` - загрузить только продажи в `raw_sales`.
+- `--only orders` - загрузить только заказы в `raw_orders`.
+- `--only stocks` - загрузить только остатки в `raw_stocks`.
+- `--only ads` - загрузить только рекламу в `raw_ads`.
+- `--only funnel` - загрузить только воронку в `funnel_analytics`.
+- `--only all` - полная синхронизация, используется по умолчанию.
+
+Дополнительные флаги:
+
+- `--skip-ads` - не загружать рекламную статистику.
+- `--skip-funnel` - не загружать воронку.
+
+## Как данные преобразуются
+
+### Нормализация строк
+
+Функции `sales_to_sheet_rows`, `orders_to_sheet_rows`, `stocks_to_sheet_rows`, `ads_to_sheet_rows`, `funnel_to_sheet_rows` приводят сырые JSON-ответы API к двумерным таблицам: первая строка содержит заголовки, остальные строки - значения.
+
+Числовые поля приводятся через `Decimal`, чтобы снизить риск ошибок округления в деньгах.
+
+### PnL по дням
+
+Функция `aggregate_daily_pnl` группирует продажи и рекламу по `(date, article)`.
+
+Продажи учитываются со знаком:
+
+- `Продажа` = `+1`;
+- `Возврат` = `-1`;
+- служебные строки без продаж учитываются только если в них есть хранение, приемка, штрафы, удержания или доплаты.
+
+Основные показатели `daily_pnl`:
+
+- `orders_amount`;
+- `sales_amount`;
+- `sales_without_spp`;
+- `wb_commission`;
+- `acquiring_fee`;
+- `storage_fee`;
+- `acceptance_fee`;
+- `penalties`;
+- `deductions`;
+- `additional_payments`;
+- `delivery_fee`;
+- `ad_spend`;
+- `cogs_amount`;
+- `net_profit`;
+- `margin_pct`.
+
+Себестоимость берется из SKU и умножается на количество продаж с учетом возвратов.
+
+### Управленческая аналитика
+
+Функция `build_analytics_tables` строит несколько срезов:
+
+- `finance_article_day_detail` - подробная экономика по артикулу и дню.
+- `analytics_article_day` - продажи, реклама, прибыль, ДРР и маржа по артикулу и дню.
+- `analytics_day` - агрегированная сводка по дням.
+- `analytics_article_period` - агрегированная сводка по артикулу за выбранный период.
+
+В расчетах используются продажи по нашей цене, СПП, вознаграждение WB, НДС WB, эквайринг, логистика, хранение, приемка, штрафы, удержания, доплаты, реклама и себестоимость.
+
+### Выкупы по датам заказов
+
+Функция `build_buyout_order_day_rows` связывает:
+
+- `raw_orders` как источник дат заказов и связки `nmId -> article`;
+- `raw_sales` как источник продаж, возвратов, дат выкупа и дат исходного заказа;
+- `raw_ads` как источник рекламных расходов по дате;
+- `funnel_analytics` как более точный источник суммы и количества заказов, выкупов и отмен.
+
+Результат сохраняется в `buyout_order_day`. Таблица помогает отвечать на вопрос: что произошло с товарами, заказанными в конкретную дату, даже если выкуп или возврат произошел позже.
+
+## SQLite-хранилище
+
+Класс `SQLiteStore` хранит все таблицы в одном файле, по умолчанию `data/wb_sync.db`.
+
+Особенности:
+
+- имена таблиц очищаются от небезопасных символов;
+- все колонки создаются как `TEXT`;
+- первая строка переданного набора считается заголовком;
+- `upsert_table` создает уникальный индекс по ключевым колонкам;
+- при `update_existing=True` обновляются только непустые новые значения;
+- при `overwrite_existing=True` свежий расчет полностью заменяет старую строку по ключу;
+- при `allow_new_columns=True` таблица расширяется новыми колонками;
+- `replace_table` полностью удаляет и пересоздает таблицу.
+
+Основные таблицы:
+
+- `SKU`/`sku` - справочник артикулов и себестоимости.
+- `raw_sales` - сырой финансовый отчет продаж.
+- `raw_orders` - сырой поток заказов.
+- `raw_ads` - рекламная статистика.
+- `raw_stocks` - текущие остатки.
+- `funnel_analytics` - воронка продаж.
+- `daily_pnl` - дневной PnL.
+- `finance_article_day_detail` - подробная экономика по дню и артикулу.
+- `analytics_article_day` - компактная аналитика по дню и артикулу.
+- `analytics_day` - дневная сводка.
+- `analytics_article_period` - период по артикулам.
+- `buyout_order_day` - заказы, выкупы, возвраты и реклама по датам заказов.
+
+## Web UI
+
+Запуск локально:
+
+```bash
+source .venv/bin/activate
+PYTHONPATH=src python web_app.py
+```
+
+Или через helper:
+
+```bash
+scripts/start_web_ui.sh
+```
+
+Веб-интерфейс:
+
+- отдает главную страницу на `/`;
+- запускает синхронизацию через `/stream`;
+- передает лог процесса в браузер потоково;
+- запускает команду `python -u -m wb_gsheets.main`;
+- показывает отчеты из SQLite;
+- поддерживает фильтр области: `ours`, `not_ours`, `all`;
+- пишет логи синхронизации в `data/sync_logs`.
+
+Основные разделы:
+
+- `/analytics/day` - сводка по дням.
+- `/analytics/period` - период по артикулам.
+- `/analytics/article-day` - дни по артикулу.
+- `/analytics/buyout-order-day` - выкупы по датам заказов.
+- `/analytics/buyout-order-week` - выкупы по неделям.
+- `/analytics/funnel-upload` - загрузка воронки.
+- `/analytics/preliminary-economics` - предварительная экономика по дням.
+- `/db` - просмотр SQLite-таблиц.
+
+## Google Sheets
+
+В основном сценарии Google Sheets используется как возможный источник справочника SKU, если таблица еще не закэширована в SQLite.
+
+В проекте также есть вспомогательные скрипты, которые напрямую пишут в Google Sheets:
+
+- `scripts/build_dashboard.py`;
+- `scripts/build_pivot_sheets.py`;
+- `scripts/build_management_viz.py`;
+- `scripts/rebuild_formula_only.py`;
+- `scripts/fix_formula_sheets.py`.
+
+Эти скрипты используют `GoogleSheetsClient`, который умеет:
+
+- создать лист, если его нет;
+- пересоздать лист;
+- прочитать значения;
+- заменить лист полностью;
+- дописать или обновить строки по ключам;
+- выполнить `batchUpdate`.
+
+Часть этих скриптов является legacy/служебной: в них встречаются жестко заданные даты и формулы, завязанные на русскую локаль Google Sheets.
+
+## Ограничения и важные детали
+
+- API Wildberries имеет лимиты. Клиент делает паузы и ретраи при `429`, timeout, SSL и сетевых ошибках.
+- Финансовый отчет грузится постранично через `rrdId`.
+- Остатки грузятся с курсором по `lastChangeDate`, если ответ достигает лимита.
+- Реклама грузится чанками до 50 кампаний и окнами до 31 дня.
+- Воронка грузится окнами по 7 дней и чанками по 20 `nmId`; при некоторых ошибках чанк дробится до отдельных `nmId`.
+- Основная база SQLite хранит значения как текст, поэтому числовая обработка выполняется в коде при построении отчетов или через явные `CAST` в SQL web UI.
+- `raw_stocks` заменяется полностью, остальные сырые таблицы обычно обновляются через upsert.
+- Производные таблицы пересчитываются из накопленных данных SQLite, поэтому повторный запуск за новый период расширяет историю, а запуск за старый период обновляет соответствующие ключи там, где включен overwrite/update.
+- Секреты сервисного аккаунта и токены не должны попадать в логи и документацию.
+
+## Команды
+
+Установка:
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+Полный CLI-запуск:
+
+```bash
+PYTHONPATH=src python -m wb_gsheets.main --date-from 2026-05-01 --date-to 2026-05-07
+```
+
+Запуск без рекламы:
+
+```bash
+PYTHONPATH=src python -m wb_gsheets.main --date-from 2026-05-01 --date-to 2026-05-07 --skip-ads
+```
+
+Запуск без воронки:
+
+```bash
+PYTHONPATH=src python -m wb_gsheets.main --date-from 2026-05-01 --date-to 2026-05-07 --skip-funnel
+```
+
+Частичная загрузка остатков:
+
+```bash
+PYTHONPATH=src python -m wb_gsheets.main --only stocks
+```
+
+Web UI:
+
+```bash
+PYTHONPATH=src python web_app.py
+```
+
+Docker:
+
+```bash
+docker compose up -d --build
+```
