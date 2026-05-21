@@ -13,7 +13,7 @@ import time
 import tempfile
 from decimal import Decimal, InvalidOperation
 from html import escape
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import os
 from math import ceil
@@ -24,6 +24,9 @@ ROOT = Path(__file__).parent
 PYTHON = sys.executable
 DB_PATH = os.getenv("SQLITE_DB_PATH", str(ROOT / "data" / "wb_sync.db")).strip() or str(ROOT / "data" / "wb_sync.db")
 SITE_PASSWORD = os.getenv("WB_SITE_PASSWORD", "321")
+EXTERNAL_SKU_XLSX_PATH = ROOT / "data" / "sku_iitech.xlsx"
+SYNC_LOG_DIR = ROOT / "data" / "sync_logs"
+LATEST_SYNC_LOG_PATH = SYNC_LOG_DIR / "latest.log"
 CORE_TABLES = [
   "finance_article_day_detail",
   "analytics_article_day",
@@ -33,6 +36,29 @@ CORE_TABLES = [
   "raw_stocks",
   "preliminary_order_economics",
 ]
+SCOPE_OPTIONS = {"ours", "not_ours", "all"}
+DEFAULT_SCOPE = "ours"
+
+
+def _sync_log_paths(date_from: str, date_to: str, only: str) -> list[Path]:
+  started_at = datetime.now().strftime("%Y%m%d_%H%M%S")
+  mode = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in (only or "all")) or "all"
+  run_log_path = SYNC_LOG_DIR / f"sync_{started_at}_{mode}_{date_from}_{date_to}.log"
+  return [run_log_path, LATEST_SYNC_LOG_PATH]
+
+
+def _write_sync_log(paths: list[Path], text: str, reset: bool = False) -> None:
+  SYNC_LOG_DIR.mkdir(parents=True, exist_ok=True)
+  timestamped = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {text}"
+  for path in paths:
+    mode = "w" if reset else "a"
+    with path.open(mode, encoding="utf-8") as fh:
+      fh.write(timestamped + "\n")
+
+
+def _emit_sync_message(log_q: queue.Queue, log_paths: list[Path], kind: str, text: str) -> None:
+  log_q.put((kind, text))
+  _write_sync_log(log_paths, f"{kind.upper()}: {text}")
 
 
 def db_store():
@@ -44,33 +70,63 @@ def db_store():
   return SQLiteStore(DB_PATH)
 
 
-REPORT_NAV_HTML = (
-  '<a href="/">Обмен</a> · '
-  '<a href="/analytics/day">Сводка по дням</a> · '
-  '<a href="/analytics/period">Период по артикулам</a> · '
-  '<a href="/analytics/article-day">Дни по артикулу</a> · '
-  '<a href="/analytics/buyout-order-day">Выкупы по датам заказов</a> · '
-  '<a href="/analytics/buyout-order-week">Выкупы по неделям</a> · '
-  '<a href="/analytics/funnel-upload">Загрузка воронки</a> · '
-  '<a href="/analytics/preliminary-economics">Предэко по дням</a> · '
-  '<a href="/analytics/preliminary-economics-summary">Предэко за период</a> · '
-  '<a href="/db?table=raw_stocks&page=1">Остатки</a> · '
-  '<a href="/db">SQLite</a>'
-)
+def _normalize_scope(scope: str | None) -> str:
+  value = str(scope or "").strip()
+  return value if value in SCOPE_OPTIONS else DEFAULT_SCOPE
 
 
-REPORT_LINKS_HTML = (
-  '<a href="/analytics/day">Сводка по дням</a>'
-  '<a href="/analytics/period">Период по артикулам</a>'
-  '<a href="/analytics/article-day">Дни по артикулу</a>'
-  '<a href="/analytics/buyout-order-day">Выкупы по датам заказов</a>'
-  '<a href="/analytics/buyout-order-week">Выкупы по неделям</a>'
-  '<a href="/analytics/funnel-upload">Загрузка воронки</a>'
-  '<a href="/analytics/preliminary-economics">Предэко по дням</a>'
-  '<a href="/analytics/preliminary-economics-summary">Предэко за период</a>'
-  '<a href="/db?table=raw_stocks&page=1">Остатки</a>'
-  '<a href="/db">SQLite</a>'
-)
+def _with_scope(path: str, scope: str) -> str:
+  scope = _normalize_scope(scope)
+  if "scope=" in path:
+    return path
+  return f"{path}{'&' if '?' in path else '?'}scope={quote_plus(scope)}"
+
+
+def _scope_control_html(scope: str) -> str:
+  selected = _normalize_scope(scope)
+  return (
+    '<span class="scope-nav" style="display:inline-flex;align-items:center;gap:6px;margin-left:8px;'
+    'padding:6px 8px;border:1px solid #cbd5e1;border-radius:999px;background:#fff;">'
+    '<label for="global-scope" style="margin:0;font-size:.78rem;font-weight:700;color:#475569;">Показ</label>'
+    '<select id="global-scope" style="border:0;background:transparent;font-size:.78rem;font-weight:700;color:#0f766e;">'
+    f'<option value="ours"{" selected" if selected == "ours" else ""}>Наши</option>'
+    f'<option value="not_ours"{" selected" if selected == "not_ours" else ""}>Не наши</option>'
+    f'<option value="all"{" selected" if selected == "all" else ""}>Все</option>'
+    '</select></span>'
+    '<script>(function(){'
+    'if(window.__wbScopeInit)return;window.__wbScopeInit=true;'
+    'window.WB_SCOPE_KEY="wb.global.scope";'
+    'window.getGlobalScope=function(){try{var value=localStorage.getItem(window.WB_SCOPE_KEY)||"ours";return ["ours","not_ours","all"].indexOf(value)>=0?value:"ours";}catch(err){return "ours";}};'
+    'window.setGlobalScope=function(value){try{localStorage.setItem(window.WB_SCOPE_KEY,value);}catch(err){}};'
+    'window.withScopeUrl=function(url){try{var next=new URL(url,window.location.origin);next.searchParams.set("scope",window.getGlobalScope());return next.pathname+next.search+next.hash;}catch(err){return url;}};'
+    'window.attachScopeLinks=function(root){var links=(root||document).querySelectorAll("a[href]");for(var i=0;i<links.length;i+=1){var href=links[i].getAttribute("href")||"";if(!href||href.startsWith("http")||href.startsWith("#")||href.startsWith("javascript:"))continue;links[i].setAttribute("href",window.withScopeUrl(href));}};'
+    'document.addEventListener("DOMContentLoaded",function(){var select=document.getElementById("global-scope");if(select){select.value=window.getGlobalScope();select.addEventListener("change",function(){window.setGlobalScope(select.value);window.location.href=window.withScopeUrl(window.location.pathname+window.location.search);});}window.attachScopeLinks(document);});'
+    '})();</script>'
+  )
+
+
+def _report_nav_html(scope: str) -> str:
+  links = " · ".join(f'<a href="{escape(_with_scope(path, scope))}">{escape(label)}</a>' for path, label in REPORT_LINK_ITEMS)
+  return f"{links}{_scope_control_html(scope)}"
+
+
+def _report_links_html(scope: str) -> str:
+  return "".join(f'<a href="{escape(_with_scope(path, scope))}">{escape(label)}</a>' for path, label in REPORT_LINK_ITEMS[1:])
+
+
+REPORT_LINK_ITEMS = [
+  ("/", "Обмен"),
+  ("/analytics/day", "Сводка по дням"),
+  ("/analytics/period", "Период по артикулам"),
+  ("/analytics/article-day", "Дни по артикулу"),
+  ("/analytics/buyout-order-day", "Выкупы по датам заказов"),
+  ("/analytics/buyout-order-week", "Выкупы по неделям"),
+  ("/analytics/funnel-upload", "Загрузка воронки"),
+  ("/analytics/preliminary-economics", "Предэко по дням"),
+  ("/analytics/preliminary-economics-summary", "Предэко за период"),
+  ("/db?table=raw_stocks&page=1", "Остатки"),
+  ("/db", "SQLite"),
+]
 
 
 def _db_connect() -> sqlite3.Connection:
@@ -119,149 +175,328 @@ def _safe_percent(numerator: float, denominator: float, min_abs_den: float = 100
   return _format_percent(numerator / denominator * 100.0)
 
 
-def _fetch_period_analytics(date_from: str, date_to: str, article_query: str = "") -> list[dict[str, str]]:
-  where = ['"Дата" >= ?', '"Дата" <= ?']
-  params: list[str] = [date_from, date_to]
+def _scope_context(conn: sqlite3.Connection | None = None) -> dict[str, object]:
+  own_conn = conn is None
+  conn = conn or _db_connect()
+  try:
+    columns = _table_columns(conn, "sku")
+    nmid_col = _first_existing(columns, ["Артикул WB", "nmId", "nm_id"])
+    article_col = _first_existing(columns, ["НАШ", "Артикул поставщика", "supplierArticle", "SKU", "sku"])
+    iitech_col = _first_existing(columns, ["ИИТех"])
+    cogs_col = _first_existing(columns, ["себестоимость", "cost_price", "cogs"])
+    if not nmid_col:
+      return {"our_nm_ids": set(), "our_articles": set(), "all_nm_ids": set(), "nm_to_article": {}, "nm_with_cogs": set()}
+
+    select_cols = [nmid_col]
+    if article_col:
+      select_cols.append(article_col)
+    if iitech_col:
+      select_cols.append(iitech_col)
+    if cogs_col:
+      select_cols.append(cogs_col)
+    sql = "SELECT " + ", ".join(_sql_ident(col) for col in select_cols) + " FROM sku"
+    rows = conn.execute(sql).fetchall()
+
+    our_nm_ids: set[str] = set()
+    our_articles: set[str] = set()
+    all_nm_ids: set[str] = set()
+    nm_to_article: dict[str, str] = {}
+    nm_with_cogs: set[str] = set()
+    for row in rows:
+      nm_id = str(row[nmid_col] or "").strip()
+      article = str(row[article_col] or "").strip() if article_col else ""
+      marker = str(row[iitech_col] or "").strip() if iitech_col else ""
+      cogs = str(row[cogs_col] or "").strip() if cogs_col else ""
+      if not nm_id:
+        continue
+      all_nm_ids.add(nm_id)
+      if article:
+        nm_to_article[nm_id] = article
+      if cogs:
+        nm_with_cogs.add(nm_id)
+      if marker:
+        our_nm_ids.add(nm_id)
+        if article:
+          our_articles.add(article)
+    return {
+      "our_nm_ids": our_nm_ids,
+      "our_articles": our_articles,
+      "all_nm_ids": all_nm_ids,
+      "nm_to_article": nm_to_article,
+      "nm_with_cogs": nm_with_cogs,
+    }
+  finally:
+    if own_conn:
+      conn.close()
+
+
+def _scope_match_nm(scope: str, nm_id: str, ctx: dict[str, object]) -> bool:
+  scope = _normalize_scope(scope)
+  if scope == "all":
+    return True
+  our_nm_ids = ctx.get("our_nm_ids", set())
+  if not nm_id:
+    return scope == "not_ours"
+  is_our = nm_id in our_nm_ids
+  return is_our if scope == "ours" else not is_our
+
+
+def _raw_sales_scope_rows(
+  conn: sqlite3.Connection,
+  scope: str,
+  date_from: str,
+  date_to: str,
+  article_query: str = "",
+) -> list[dict[str, object]]:
+  ctx = _scope_context(conn)
   article_query = article_query.strip()
-  if article_query:
-    where.append('"Артикул" = ?')
-    params.append(article_query)
+  rows = conn.execute(
+    """
+    SELECT
+      substr(saleDt, 1, 10) AS sale_date,
+      nmId,
+      vendorCode,
+      SUM(CASE docTypeName WHEN 'Возврат' THEN -1 ELSE 1 END * CAST(quantity AS REAL)) AS qty,
+      SUM(CASE docTypeName WHEN 'Возврат' THEN -1 ELSE 1 END * CAST(retailPriceWithDisc AS REAL) * CAST(quantity AS REAL)) AS sales_sum
+    FROM raw_sales
+    WHERE substr(saleDt, 1, 10) >= ? AND substr(saleDt, 1, 10) <= ?
+      AND docTypeName IN ('Продажа', 'Возврат')
+    GROUP BY sale_date, nmId, vendorCode
+    ORDER BY sale_date DESC, vendorCode ASC, nmId ASC
+    """,
+    (date_from, date_to),
+  ).fetchall()
+  ads_map: dict[tuple[str, str], float] = {}
+  if "raw_ads" in {str(row["name"]) for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}:
+    for row in conn.execute(
+      "SELECT date, nmId, SUM(CAST(sum AS REAL)) AS ads_sum FROM raw_ads "
+      "WHERE date >= ? AND date <= ? GROUP BY date, nmId",
+      (date_from, date_to),
+    ).fetchall():
+      ads_map[(str(row["date"] or "").strip(), str(row["nmId"] or "").strip())] = _to_float(row["ads_sum"])
 
-  where_sql = f"WHERE {' AND '.join(where)}"
-
-  with _db_connect() as conn:
-    rows = conn.execute(
-      (
-        "SELECT \"Артикул\", "
-        "SUM(\"Продажи по нашей цене\") AS \"Продажи по нашей цене\", "
-        "SUM(\"Реклама\") AS \"Реклама\", "
-        "SUM(\"Чистая прибыль\") AS \"Чистая прибыль\", "
-        "CASE WHEN SUM(\"Продажи по нашей цене\") != 0 "
-        "THEN SUM(\"Реклама\") / SUM(\"Продажи по нашей цене\") * 100 ELSE 0 END AS \"ДРР\", "
-        "CASE WHEN SUM(\"Продажи по нашей цене\") != 0 "
-        "THEN SUM(\"Чистая прибыль\") / SUM(\"Продажи по нашей цене\") * 100 ELSE 0 END AS \"% маржи\" "
-        f"FROM analytics_article_day {where_sql} GROUP BY \"Артикул\" ORDER BY \"Артикул\" ASC LIMIT 5000"
-      ),
-      params,
-    ).fetchall()
-
-  if not rows:
-    return []
-
-  return [
-    {column: _format_metric(column, row[idx]) for idx, column in enumerate(rows[0].keys())}
-    for row in rows
-  ]
-
-
-def _fetch_article_day_analytics(article_query: str, date_from: str | None, date_to: str | None) -> list[dict[str, str]]:
-  where = []
-  params: list[str] = []
-  article_query = article_query.strip()
-
-  if article_query:
-    where.append('"Артикул" = ?')
-    params.append(article_query)
-  if date_from:
-    where.append('"Дата" >= ?')
-    params.append(date_from)
-  if date_to:
-    where.append('"Дата" <= ?')
-    params.append(date_to)
-
-  where_sql = f"WHERE {' AND '.join(where)}" if where else ""
-  sql = (
-    "SELECT \"Артикул\", \"Дата\", \"Продажи по нашей цене\", \"Реклама\", \"Чистая прибыль\", \"ДРР\", \"% маржи\" "
-    f"FROM analytics_article_day {where_sql} ORDER BY \"Дата\" DESC, \"Артикул\" ASC LIMIT 500"
-  )
-
-  with _db_connect() as conn:
-    rows = conn.execute(sql, params).fetchall()
-    if article_query and not rows:
-      fallback_where = []
-      fallback_params: list[str] = []
-      fallback_where.append('"Артикул" LIKE ?')
-      fallback_params.append(f"%{article_query}%")
-      if date_from:
-        fallback_where.append('"Дата" >= ?')
-        fallback_params.append(date_from)
-      if date_to:
-        fallback_where.append('"Дата" <= ?')
-        fallback_params.append(date_to)
-      fallback_sql = (
-        "SELECT \"Артикул\", \"Дата\", \"Продажи по нашей цене\", \"Реклама\", \"Чистая прибыль\", \"ДРР\", \"% маржи\" "
-        f"FROM analytics_article_day WHERE {' AND '.join(fallback_where)} ORDER BY \"Дата\" DESC, \"Артикул\" ASC LIMIT 500"
-      )
-      rows = conn.execute(fallback_sql, fallback_params).fetchall()
-
-  payload: list[dict[str, str]] = []
+  payload: list[dict[str, object]] = []
+  nm_to_article = ctx.get("nm_to_article", {})
   for row in rows:
-    payload.append(
-      {
-        "Артикул": _format_metric("Артикул", row["Артикул"]),
-        "Дата": _format_metric("Дата", row["Дата"]),
-        "Продажи по нашей цене": _format_metric("Продажи по нашей цене", row["Продажи по нашей цене"]),
-        "Реклама": _format_metric("Реклама", row["Реклама"]),
-        "Чистая прибыль": _format_metric("Чистая прибыль", row["Чистая прибыль"]),
-        "ДРР": _format_metric("ДРР", row["ДРР"]),
-        "% маржи": _format_metric("% маржи", row["% маржи"]),
-      }
-    )
+    nm_id = str(row["nmId"] or "").strip()
+    if not _scope_match_nm(scope, nm_id, ctx):
+      continue
+    article = str(nm_to_article.get(nm_id) or row["vendorCode"] or nm_id).strip()
+    if article_query and article_query not in {article, nm_id} and article_query.lower() not in article.lower():
+      continue
+    payload.append({
+      "date": str(row["sale_date"] or "").strip(),
+      "nm_id": nm_id,
+      "article": article,
+      "sales": _to_float(row["sales_sum"]),
+      "ads": ads_map.get((str(row["sale_date"] or "").strip(), nm_id), 0.0),
+    })
   return payload
 
 
-def _fetch_day_analytics(date_from: str, date_to: str) -> dict[str, object]:
+def _fetch_period_analytics(date_from: str, date_to: str, article_query: str = "", scope: str = DEFAULT_SCOPE) -> list[dict[str, str]]:
+  scope = _normalize_scope(scope)
   with _db_connect() as conn:
-    rows = conn.execute(
-      """
-      SELECT
-        "Дата",
-        "Продажи по нашей цене, р",
-        "Реклама, р",
-        "Чистая прибыль",
-        "ДРР",
-        "% маржи"
-      FROM analytics_day
-      WHERE "Дата" >= ? AND "Дата" <= ?
-      ORDER BY "Дата" DESC
-      """,
-      (date_from, date_to),
-    ).fetchall()
+    if scope == "ours":
+      ctx = _scope_context(conn)
+      our_articles = sorted(ctx.get("our_articles", set()))
+      if not our_articles:
+        return []
+      where = ['"Дата" >= ?', '"Дата" <= ?']
+      params: list[str] = [date_from, date_to]
+      article_query = article_query.strip()
+      if article_query:
+        where.append('"Артикул" = ?')
+        params.append(article_query)
+      placeholders = ", ".join("?" for _ in our_articles)
+      where.append(f'"Артикул" IN ({placeholders})')
+      params.extend(our_articles)
+      where_sql = f"WHERE {' AND '.join(where)}"
+      rows = conn.execute(
+        (
+          "SELECT \"Артикул\", "
+          "SUM(\"Продажи по нашей цене\") AS \"Продажи по нашей цене\", "
+          "SUM(\"Реклама\") AS \"Реклама\", "
+          "SUM(\"Чистая прибыль\") AS \"Чистая прибыль\", "
+          "CASE WHEN SUM(\"Продажи по нашей цене\") != 0 "
+          "THEN SUM(\"Реклама\") / SUM(\"Продажи по нашей цене\") * 100 ELSE 0 END AS \"ДРР\", "
+          "CASE WHEN SUM(\"Продажи по нашей цене\") != 0 "
+          "THEN SUM(\"Чистая прибыль\") / SUM(\"Продажи по нашей цене\") * 100 ELSE 0 END AS \"% маржи\" "
+          f"FROM analytics_article_day {where_sql} GROUP BY \"Артикул\" ORDER BY \"Артикул\" ASC LIMIT 5000"
+        ),
+        params,
+      ).fetchall()
+      return [
+        {column: _format_metric(column, row[idx]) for idx, column in enumerate(rows[0].keys())}
+        for row in rows
+      ] if rows else []
 
-  payload_rows: list[dict[str, str]] = []
-  total_sales = 0.0
-  total_ads = 0.0
-  total_profit = 0.0
+    grouped: dict[str, dict[str, float | str]] = {}
+    for row in _raw_sales_scope_rows(conn, scope, date_from, date_to, article_query):
+      bucket = grouped.setdefault(str(row["article"]), {"Артикул": str(row["article"]), "sales": 0.0, "ads": 0.0})
+      bucket["sales"] += float(row["sales"])
+      bucket["ads"] += float(row["ads"])
+    result = []
+    for article in sorted(grouped):
+      bucket = grouped[article]
+      sales = float(bucket["sales"])
+      ads = float(bucket["ads"])
+      result.append({
+        "Артикул": str(bucket["Артикул"]),
+        "Продажи по нашей цене": _format_metric("Продажи по нашей цене", sales),
+        "Реклама": _format_metric("Реклама", ads),
+        "Чистая прибыль": "—",
+        "ДРР": _safe_percent(ads, sales),
+        "% маржи": "—",
+      })
+    return result
 
-  for row in rows:
-    sales = _to_float(row["Продажи по нашей цене, р"])
-    ads = _to_float(row["Реклама, р"])
-    profit = _to_float(row["Чистая прибыль"])
-    total_sales += sales
-    total_ads += ads
-    total_profit += profit
-    payload_rows.append(
-      {
-        "Дата": _format_metric("Дата", row["Дата"]),
+
+def _fetch_article_day_analytics(article_query: str, date_from: str | None, date_to: str | None, scope: str = DEFAULT_SCOPE) -> list[dict[str, str]]:
+  scope = _normalize_scope(scope)
+  with _db_connect() as conn:
+    if scope == "ours":
+      ctx = _scope_context(conn)
+      our_articles = sorted(ctx.get("our_articles", set()))
+      if not our_articles:
+        return []
+      where = []
+      params: list[str] = []
+      article_query = article_query.strip()
+      if article_query:
+        where.append('"Артикул" = ?')
+        params.append(article_query)
+      if date_from:
+        where.append('"Дата" >= ?')
+        params.append(date_from)
+      if date_to:
+        where.append('"Дата" <= ?')
+        params.append(date_to)
+      placeholders = ", ".join("?" for _ in our_articles)
+      where.append(f'"Артикул" IN ({placeholders})')
+      params.extend(our_articles)
+      where_sql = f"WHERE {' AND '.join(where)}" if where else ""
+      rows = conn.execute(
+        "SELECT \"Артикул\", \"Дата\", \"Продажи по нашей цене\", \"Реклама\", \"Чистая прибыль\", \"ДРР\", \"% маржи\" "
+        f"FROM analytics_article_day {where_sql} ORDER BY \"Дата\" DESC, \"Артикул\" ASC LIMIT 500",
+        params,
+      ).fetchall()
+      return [
+        {
+          "Артикул": _format_metric("Артикул", row["Артикул"]),
+          "Дата": _format_metric("Дата", row["Дата"]),
+          "Продажи по нашей цене": _format_metric("Продажи по нашей цене", row["Продажи по нашей цене"]),
+          "Реклама": _format_metric("Реклама", row["Реклама"]),
+          "Чистая прибыль": _format_metric("Чистая прибыль", row["Чистая прибыль"]),
+          "ДРР": _format_metric("ДРР", row["ДРР"]),
+          "% маржи": _format_metric("% маржи", row["% маржи"]),
+        }
+        for row in rows
+      ]
+
+    if not date_from or not date_to:
+      return []
+    payload = []
+    for row in _raw_sales_scope_rows(conn, scope, date_from, date_to, article_query):
+      sales = float(row["sales"])
+      ads = float(row["ads"])
+      payload.append({
+        "Артикул": str(row["article"]),
+        "Дата": str(row["date"]),
+        "Продажи по нашей цене": _format_metric("Продажи по нашей цене", sales),
+        "Реклама": _format_metric("Реклама", ads),
+        "Чистая прибыль": "—",
+        "ДРР": _safe_percent(ads, sales),
+        "% маржи": "—",
+      })
+    return payload[:500]
+
+
+def _fetch_day_analytics(date_from: str, date_to: str, scope: str = DEFAULT_SCOPE) -> dict[str, object]:
+  scope = _normalize_scope(scope)
+  with _db_connect() as conn:
+    if scope == "ours":
+      rows = conn.execute(
+        """
+        SELECT
+          "Дата",
+          "Продажи по нашей цене, р",
+          "Реклама, р",
+          "Чистая прибыль",
+          "ДРР",
+          "% маржи"
+        FROM analytics_day
+        WHERE "Дата" >= ? AND "Дата" <= ?
+        ORDER BY "Дата" DESC
+        """,
+        (date_from, date_to),
+      ).fetchall()
+
+      payload_rows: list[dict[str, str]] = []
+      total_sales = 0.0
+      total_ads = 0.0
+      total_profit = 0.0
+      for row in rows:
+        sales = _to_float(row["Продажи по нашей цене, р"])
+        ads = _to_float(row["Реклама, р"])
+        profit = _to_float(row["Чистая прибыль"])
+        total_sales += sales
+        total_ads += ads
+        total_profit += profit
+        payload_rows.append(
+          {
+            "Дата": _format_metric("Дата", row["Дата"]),
+            "Продажи": _format_metric("Продажи", sales),
+            "Реклама": _format_metric("Реклама", ads),
+            "Чистая прибыль": _format_metric("Чистая прибыль", profit),
+            "ДРР": _format_metric("ДРР", row["ДРР"]),
+            "% маржи": _format_metric("% маржи", row["% маржи"]),
+          }
+        )
+      return {
+        "rows": payload_rows,
+        "summary": {
+          "days": str(len(payload_rows)),
+          "sales": _format_metric("Продажи", total_sales),
+          "ads": _format_metric("Реклама", total_ads),
+          "profit": _format_metric("Чистая прибыль", total_profit),
+          "drr": _format_metric("ДРР", (total_ads / total_sales * 100.0) if total_sales else 0.0),
+          "margin": _format_metric("% маржи", (total_profit / total_sales * 100.0) if total_sales else 0.0),
+        },
+      }
+
+    grouped: dict[str, dict[str, float]] = {}
+    for row in _raw_sales_scope_rows(conn, scope, date_from, date_to):
+      bucket = grouped.setdefault(str(row["date"]), {"sales": 0.0, "ads": 0.0})
+      bucket["sales"] += float(row["sales"])
+      bucket["ads"] += float(row["ads"])
+    payload_rows = []
+    total_sales = 0.0
+    total_ads = 0.0
+    for day in sorted(grouped.keys(), reverse=True):
+      sales = grouped[day]["sales"]
+      ads = grouped[day]["ads"]
+      total_sales += sales
+      total_ads += ads
+      payload_rows.append({
+        "Дата": day,
         "Продажи": _format_metric("Продажи", sales),
         "Реклама": _format_metric("Реклама", ads),
-        "Чистая прибыль": _format_metric("Чистая прибыль", profit),
-        "ДРР": _format_metric("ДРР", row["ДРР"]),
-        "% маржи": _format_metric("% маржи", row["% маржи"]),
-      }
-    )
-
-  total_drr = (total_ads / total_sales * 100.0) if total_sales else 0.0
-  total_margin = (total_profit / total_sales * 100.0) if total_sales else 0.0
-  summary = {
-    "days": str(len(payload_rows)),
-    "sales": _format_metric("Продажи", total_sales),
-    "ads": _format_metric("Реклама", total_ads),
-    "profit": _format_metric("Чистая прибыль", total_profit),
-    "drr": _format_metric("ДРР", total_drr),
-    "margin": _format_metric("% маржи", total_margin),
-  }
-  return {"rows": payload_rows, "summary": summary}
+        "Чистая прибыль": "—",
+        "ДРР": _safe_percent(ads, sales),
+        "% маржи": "—",
+      })
+    return {
+      "rows": payload_rows,
+      "summary": {
+        "days": str(len(payload_rows)),
+        "sales": _format_metric("Продажи", total_sales),
+        "ads": _format_metric("Реклама", total_ads),
+        "profit": "—",
+        "drr": _format_metric("ДРР", (total_ads / total_sales * 100.0) if total_sales else 0.0),
+        "margin": "—",
+      },
+    }
 
 
 def _date_range_limited(date_from: str, date_to: str, max_days: int = 30) -> tuple[list[str], str, str]:
@@ -382,27 +617,38 @@ def _buyout_nm_join(conn: sqlite3.Connection) -> str:
   return "LEFT JOIN (SELECT NULL AS article, NULL AS nmid WHERE 0) nm_data ON 1 = 0"
 
 
-def _fetch_buyout_subjects(date_from: str, date_to: str) -> list[str]:
+def _fetch_buyout_subjects(date_from: str, date_to: str, scope: str = DEFAULT_SCOPE) -> list[str]:
   dates, effective_from, effective_to = _date_range_limited(date_from, date_to, max_days=30)
   with _db_connect() as conn:
+    ctx = _scope_context(conn)
+    scope_where = ""
+    scope_params: list[str] = []
+    our_nm_ids = sorted(ctx.get("our_nm_ids", set()))
+    if scope != "all" and our_nm_ids:
+      placeholders = ", ".join("?" for _ in our_nm_ids)
+      operator = "IN" if scope == "ours" else "NOT IN"
+      scope_where = f' AND buyout_order_day."nmId" {operator} ({placeholders})'
+      scope_params.extend(our_nm_ids)
     rows = conn.execute(
       (
         "SELECT sku_subject.subject AS subject, SUM(CAST(buyout_order_day.\"Сумма заказов\" AS REAL)) AS orders_sum "
         "FROM buyout_order_day "
         f"{_buyout_subject_join()} "
         "WHERE buyout_order_day.\"Дата\" >= ? AND buyout_order_day.\"Дата\" <= ? "
+        f"{scope_where} "
         "AND TRIM(COALESCE(sku_subject.subject, '')) != '' "
         "GROUP BY sku_subject.subject "
         "ORDER BY orders_sum DESC, sku_subject.subject ASC "
         "LIMIT 1000"
       ),
-      (effective_from, effective_to),
+      [effective_from, effective_to, *scope_params],
     ).fetchall()
   return [str(row["subject"]) for row in rows if str(row["subject"]).strip()]
 
 
-def _fetch_buyout_articles(date_from: str, date_to: str, subject: str = "") -> list[dict[str, object]]:
+def _fetch_buyout_articles(date_from: str, date_to: str, subject: str = "", scope: str = DEFAULT_SCOPE) -> list[dict[str, object]]:
   dates, effective_from, effective_to = _date_range_limited(date_from, date_to, max_days=30)
+  day_count = max(1, len(dates))
   where = ['buyout_order_day."Дата" >= ?', 'buyout_order_day."Дата" <= ?']
   params: list[str] = [effective_from, effective_to]
   subject = subject.strip()
@@ -410,42 +656,53 @@ def _fetch_buyout_articles(date_from: str, date_to: str, subject: str = "") -> l
     where.append("sku_subject.subject = ?")
     params.append(subject)
   with _db_connect() as conn:
-    stocks_join = _stocks_join(conn)
-    nm_join = _buyout_nm_join(conn)
+    ctx = _scope_context(conn)
+    our_nm_ids = sorted(ctx.get("our_nm_ids", set()))
+    if scope != "all" and our_nm_ids:
+      placeholders = ", ".join("?" for _ in our_nm_ids)
+      operator = "IN" if scope == "ours" else "NOT IN"
+      where.append(f'buyout_order_day."nmId" {operator} ({placeholders})')
+      params.extend(our_nm_ids)
     rows = conn.execute(
       (
-        "WITH revenue AS ("
-        "SELECT \"Артикул\" AS article, SUM(CAST(\"Продажи по нашей цене\" AS REAL)) AS revenue "
-        "FROM analytics_article_day WHERE \"Дата\" >= ? AND \"Дата\" <= ? GROUP BY \"Артикул\""
-        ") "
         "SELECT "
         "buyout_order_day.\"nmId\" AS nmid, "
         "MAX(buyout_order_day.\"Артикул\") AS \"Артикул\", "
         "MAX(stock_data.stock) AS stock, "
-        "COALESCE(MAX(revenue.revenue), 0) AS revenue, "
-        "SUM(CAST(buyout_order_day.\"Сумма заказов\" AS REAL)) AS orders_sum "
+        "SUM(CAST(buyout_order_day.\"Выкупы товаров, заказанных в эту дату, шт\" AS REAL)) AS ordered_buyouts, "
+        "SUM(CAST(buyout_order_day.\"Сумма выкупов в эту дату\" AS REAL)) AS revenue, "
+        "SUM(CAST(buyout_order_day.\"Сумма заказов\" AS REAL)) AS orders_sum, "
+        "COALESCE(fa.total_buyout, 0) AS fa_buyout, "
+        "COALESCE(fa.total_cancel, 0) AS fa_cancel "
         "FROM buyout_order_day "
         f"{_buyout_subject_join()} "
-        f"{stocks_join} "
-        f"{nm_join} "
-        "LEFT JOIN revenue ON revenue.article = buyout_order_day.\"Артикул\" "
+        f"{_stocks_join(conn)} "
+        "LEFT JOIN ("
+        "  SELECT nmId, SUM(CAST(buyoutCount AS REAL)) AS total_buyout, SUM(CAST(cancelCount AS REAL)) AS total_cancel"
+        "  FROM funnel_analytics WHERE date >= ? AND date <= ? GROUP BY nmId"
+        ") fa ON fa.nmId = buyout_order_day.\"nmId\" "
         f"WHERE {' AND '.join(where)} "
         "GROUP BY buyout_order_day.\"nmId\" "
         "ORDER BY revenue DESC, orders_sum DESC, buyout_order_day.\"Артикул\" ASC "
         "LIMIT 1000"
       ),
-      [effective_from, effective_to, *params],
+      [effective_from, effective_to] + params,
     ).fetchall()
   result = []
   for row in rows:
     article = str(row["Артикул"]).strip()
     if not article:
       continue
+    fa_b = _to_float(row["fa_buyout"])
+    fa_c = _to_float(row["fa_cancel"])
+    wb_buyout_pct = fa_b / (fa_b + fa_c) * 100.0 if (fa_b + fa_c) > 0 else None
     result.append({
       "article": article,
       "nmid": str(row["nmid"]).strip() if row["nmid"] is not None else "",
       "stock": _to_float(row["stock"]) if row["stock"] is not None else None,
+      "buyouts": _to_float(row["ordered_buyouts"]) / day_count,
       "revenue": _to_float(row["revenue"]),
+      "wb_buyout_pct": wb_buyout_pct,
     })
   return result
 
@@ -457,6 +714,7 @@ def _fetch_buyout_order_day_pivot(
   articles: list[str] | None = None,
   subject: str = "",
   granularity: str = "day",
+  scope: str = DEFAULT_SCOPE,
 ) -> dict[str, object]:
   dates, effective_from, effective_to = _date_range_limited(date_from, date_to, max_days=93 if granularity == "week" else 30)
   daily_dates = list(dates)
@@ -481,8 +739,15 @@ def _fetch_buyout_order_day_pivot(
     where.append("sku_subject.subject = ?")
     params.append(subject)
 
-  where_sql = f"WHERE {' AND '.join(where)}"
   with _db_connect() as conn:
+    ctx = _scope_context(conn)
+    our_nm_ids = sorted(ctx.get("our_nm_ids", set()))
+    if scope != "all" and our_nm_ids:
+      placeholders = ", ".join("?" for _ in our_nm_ids)
+      operator = "IN" if scope == "ours" else "NOT IN"
+      where.append(f'buyout_order_day."nmId" {operator} ({placeholders})')
+      params.extend(our_nm_ids)
+    where_sql = f"WHERE {' AND '.join(where)}"
     spp_without_by_date: dict[str, float] = {}
     spp_with_by_date: dict[str, float] = {}
     cogs_join = _buyout_cogs_join(conn)
@@ -502,6 +767,11 @@ def _fetch_buyout_order_day_pivot(
         "raw_sales.docTypeName IN ('Продажа', 'Возврат')",
       ]
       raw_params: list[str] = [effective_from, effective_to]
+      if scope != "all" and our_nm_ids:
+        placeholders = ", ".join("?" for _ in our_nm_ids)
+        operator = "IN" if scope == "ours" else "NOT IN"
+        raw_where.append(f"raw_sales.nmId {operator} ({placeholders})")
+        raw_params.extend(our_nm_ids)
       if selected_articles:
         placeholders = ", ".join("?" for _ in selected_articles)
         raw_where.append(f"raw_sales.nmId IN ({placeholders})")
@@ -552,6 +822,11 @@ def _fetch_buyout_order_day_pivot(
 
     funnel_where = ["date >= ?", "date <= ?"]
     funnel_params: list[str] = [effective_from, effective_to]
+    if scope != "all" and our_nm_ids:
+      placeholders = ", ".join("?" for _ in our_nm_ids)
+      operator = "IN" if scope == "ours" else "NOT IN"
+      funnel_where.append(f"nmId {operator} ({placeholders})")
+      funnel_params.extend(our_nm_ids)
     if selected_articles:
       placeholders = ", ".join("?" for _ in selected_articles)
       funnel_where.append(f"nmId IN ({placeholders})")
@@ -584,7 +859,9 @@ def _fetch_buyout_order_day_pivot(
         "SUM(CAST(openCount AS REAL)) AS open_count, "
         "SUM(CAST(cartCount AS REAL)) AS cart_count, "
         "SUM(CAST(orderCount AS REAL)) AS order_count, "
-        "SUM(CAST(buyoutCount AS REAL)) AS buyout_count "
+        "SUM(CAST(orderSum AS REAL)) AS order_sum, "
+        "SUM(CAST(buyoutCount AS REAL)) AS buyout_count, "
+        "SUM(CAST(cancelCount AS REAL)) AS cancel_count "
         "FROM funnel_analytics "
         f"WHERE {' AND '.join(funnel_where)} "
         "GROUP BY date ORDER BY date ASC"
@@ -596,7 +873,9 @@ def _fetch_buyout_order_day_pivot(
         "open_count": _to_float(row["open_count"]),
         "cart_count": _to_float(row["cart_count"]),
         "order_count": _to_float(row["order_count"]),
+        "order_sum": _to_float(row["order_sum"]),
         "buyout_count": _to_float(row["buyout_count"]),
+        "cancel_count": _to_float(row["cancel_count"]),
       }
       for row in funnel_rows
     }
@@ -609,6 +888,11 @@ def _fetch_buyout_order_day_pivot(
     }:
       impression_where = ["date >= ?", "date <= ?"]
       impression_params: list[str] = [effective_from, effective_to]
+      if scope != "all" and our_nm_ids:
+        placeholders = ", ".join("?" for _ in our_nm_ids)
+        operator = "IN" if scope == "ours" else "NOT IN"
+        impression_where.append(f"nmId {operator} ({placeholders})")
+        impression_params.extend(our_nm_ids)
       if selected_articles:
         placeholders = ", ".join("?" for _ in selected_articles)
         impression_where.append(f"nmId IN ({placeholders})")
@@ -828,12 +1112,15 @@ def _fetch_buyout_order_day_pivot(
     "total": format_percent(total_spp_percent),
     "values": spp_values,
     "raw_values": spp_raw,
-    "kind": "percent_expense",
+    "kind": "percent_income",
     "color_threshold": 3,
   })
 
   def funnel_value(day: str, key: str) -> float:
-    return float(funnel_by_date.get(day, {}).get(key, 0.0))
+    value = float(funnel_by_date.get(day, {}).get(key, 0.0))
+    if key == "order_count" and value == 0.0 and float(funnel_by_date.get(day, {}).get("order_sum", 0.0)) > 0:
+      return day_value(day, "orders_qty")
+    return value
 
   def open_value(day: str) -> float:
     uploaded_value = uploaded_open_by_date.get(day)
@@ -849,7 +1136,8 @@ def _fetch_buyout_order_day_pivot(
     ("Воронка", "CR1", lambda day: (funnel_value(day, "cart_count"), open_value(day)), "percent_ratio", "percent_income"),
     ("Воронка", "Заказы", lambda day: funnel_value(day, "order_count"), "number", "income"),
     ("Воронка", "CR2", lambda day: (funnel_value(day, "order_count"), funnel_value(day, "cart_count")), "percent_ratio", "percent_income"),
-    ("Воронка", "% выкупа", lambda day: (funnel_value(day, "buyout_count"), funnel_value(day, "order_count")), "percent_ratio", "percent_income"),
+    ("Воронка", "% выкупа WB", lambda day: (funnel_value(day, "buyout_count"), funnel_value(day, "buyout_count") + funnel_value(day, "cancel_count")), "percent_ratio", "percent_income"),
+    ("Воронка", "% выкупа от заказов", lambda day: (funnel_value(day, "buyout_count"), funnel_value(day, "order_count")), "percent_ratio", "percent_income"),
     ("Стоимость воронки", "Цена показа", lambda day: (day_value(day, "ads"), impression_by_date.get(day, 0.0)), "money_ratio", "expense"),
     ("Стоимость воронки", "Цена клика", lambda day: (day_value(day, "ads"), open_value(day)), "money_ratio", "expense"),
     ("Стоимость воронки", "Цена корзины", lambda day: (day_value(day, "ads"), funnel_value(day, "cart_count")), "money_ratio", "expense"),
@@ -918,15 +1206,6 @@ def _fetch_buyout_order_day_pivot(
       "percent_expense",
     ),
     (
-      "Расходы",
-      "ДРР от выкупов заказанных товаров",
-      lambda row, ads: ads,
-      lambda total_num, total_den: _safe_percent(total_num, total_den),
-      lambda num, den: _safe_percent(num, den),
-      "ordered_buyout_sum",
-      "percent_expense",
-    ),
-    (
       "Доходность",
       "Прибыль от выкупов в эту дату",
       lambda row, ads: _to_float(row["event_for_pay_sum"]) - ads - _to_float(row["event_cogs_sum"]) if row else -ads,
@@ -951,15 +1230,6 @@ def _fetch_buyout_order_day_pivot(
       lambda total_num, total_den: _safe_percent(total_num, total_den),
       lambda num, den: _safe_percent(num, den),
       "event_buyout_sum",
-      "percent_income",
-    ),
-    (
-      "Доходность",
-      "Маржинальность от выкупов по заказам",
-      lambda row, ads: (_to_float(row["ordered_for_pay_sum"]) - ads - _to_float(row["ordered_cogs_sum"])) if row else -ads,
-      lambda total_num, total_den: _safe_percent(total_num, total_den),
-      lambda num, den: _safe_percent(num, den),
-      "ordered_buyout_sum",
       "percent_income",
     ),
   ]
@@ -1015,6 +1285,32 @@ def _sum_expr(columns: set[str], candidates: list[str]) -> tuple[str, list[str]]
     return "0", []
   expr = " + ".join(f"COALESCE(SUM({_sql_ident(col)}), 0)" for col in used)
   return expr, used
+
+
+def _db_scope_filter(conn: sqlite3.Connection, table_name: str, scope: str) -> tuple[str, list[str]]:
+  scope = _normalize_scope(scope)
+  if scope == "all":
+    return "", []
+  ctx = _scope_context(conn)
+  our_nm_ids = sorted(ctx.get("our_nm_ids", set()))
+  our_articles = sorted(ctx.get("our_articles", set()))
+  columns = _table_columns(conn, table_name)
+  direct_col = _first_existing(columns, ["nmId", "nm_id", "Артикул WB"])
+  if direct_col:
+    if not our_nm_ids:
+      return ("WHERE 1 = 0", []) if scope == "ours" else ("", [])
+    placeholders = ", ".join("?" for _ in our_nm_ids)
+    operator = "IN" if scope == "ours" else "NOT IN"
+    return f"WHERE {_sql_ident(direct_col)} {operator} ({placeholders})", our_nm_ids
+
+  article_col = _first_existing(columns, ["Артикул", "Артикул поставщика", "supplierArticle", "SKU", "sku", "Артикул / SKU", "vendorCode"])
+  if article_col:
+    if not our_articles:
+      return ("WHERE 1 = 0", []) if scope == "ours" else ("", [])
+    placeholders = ", ".join("?" for _ in our_articles)
+    operator = "IN" if scope == "ours" else "NOT IN"
+    return f"WHERE {_sql_ident(article_col)} {operator} ({placeholders})", our_articles
+  return "", []
 
 
 def _ensure_preliminary_economics_tables(conn: sqlite3.Connection) -> None:
@@ -1100,6 +1396,7 @@ def _fetch_preliminary_economics(
   article_query: str = "",
   buyout_percent: float = 30.0,
   aggregate_by_period: bool = False,
+  scope: str = DEFAULT_SCOPE,
 ) -> dict[str, object]:
   article_query = article_query.strip()
   buyout_percent = max(0.0, min(100.0, buyout_percent))
@@ -1107,6 +1404,7 @@ def _fetch_preliminary_economics(
   with _db_connect() as conn:
     _ensure_preliminary_economics_tables(conn)
     columns = _table_columns(conn, "finance_article_day_detail")
+    ctx = _scope_context(conn)
 
     sku_col = _first_existing(columns, ["Артикул", "SKU"])
     date_col = _first_existing(columns, ["Дата", "date"])
@@ -1124,6 +1422,14 @@ def _fetch_preliminary_economics(
     if article_query:
       where.append(f"{_sql_ident(sku_col)} = ?")
       params.append(article_query)
+    if scope != "all":
+      our_articles = sorted(ctx.get("our_articles", set()))
+      if not our_articles:
+        return {"rows": [], "additional_rate": "0.00%", "expense_components": []}
+      placeholders = ", ".join("?" for _ in our_articles)
+      operator = "IN" if scope == "ours" else "NOT IN"
+      where.append(f"{_sql_ident(sku_col)} {operator} ({placeholders})")
+      params.extend(our_articles)
 
     orders_count_expr = f"COALESCE(SUM({_sql_ident(orders_count_col)}), 0)" if orders_count_col else "0"
     select_date = f"{_sql_ident(date_col)} AS date, " if not aggregate_by_period else ""
@@ -1208,8 +1514,8 @@ def _fetch_preliminary_economics(
           "Реклама, ₽": _format_metric("Реклама, ₽", advertising),
           "% рекламы": _format_percent(ad_pct),
           "Дополнительные расходы, ₽": _format_metric("Дополнительные расходы, ₽", additional_expenses),
-          "Предварительная прибыль, ₽": _format_metric("Предварительная прибыль, ₽", preliminary_profit),
-          "% маржинальности": _format_percent(margin_pct),
+          "Предварительная прибыль, ₽": _format_metric("Предварительная прибыль, ₽", preliminary_profit) if scope == "ours" else "—",
+          "% маржинальности": _format_percent(margin_pct) if scope == "ours" else "—",
         }
       )
       if not aggregate_by_period:
@@ -1258,7 +1564,7 @@ def _fetch_preliminary_economics(
   }
 
 
-def _render_table_links_html() -> str:
+def _render_table_links_html(scope: str = DEFAULT_SCOPE) -> str:
   try:
     existing_tables = db_store().list_tables()
   except Exception:
@@ -1273,22 +1579,39 @@ def _render_table_links_html() -> str:
     table_q = quote_plus(table)
     cls = "" if table in existing_set else " pending"
     suffix = "" if table in existing_set else " (пусто)"
-    links.append(f'<a class="tbl-chip{cls}" href="/db?table={table_q}&page=1">{escape(table)}{escape(suffix)}</a>')
+    links.append(f'<a class="tbl-chip{cls}" href="{escape(_with_scope(f"/db?table={table_q}&page=1", scope))}">{escape(table)}{escape(suffix)}</a>')
   return '<div class="tables-links">' + "".join(links) + "</div>"
 
-def run_sync(date_from: str, date_to: str, skip_ads: bool, skip_funnel: bool, log_q: queue.Queue) -> None:
+def run_sync(date_from: str, date_to: str, skip_ads: bool, skip_funnel: bool, log_q: queue.Queue, only: str = "all") -> None:
     cmd = [PYTHON, "-u", "-m", "wb_gsheets.main", "--date-from", date_from, "--date-to", date_to]
-    if skip_ads:
+    if only != "all":
+        cmd.extend(["--only", only])
+    elif skip_ads:
         cmd.append("--skip-ads")
-    if skip_funnel:
+    if only == "all" and skip_funnel:
         cmd.append("--skip-funnel")
 
     env_patch = {"PYTHONPATH": str(ROOT / "src"), "PYTHONUNBUFFERED": "1"}
     env = {**os.environ, **env_patch}
+    log_paths = _sync_log_paths(date_from, date_to, only)
+    _write_sync_log(
+        log_paths,
+        f"Новый запуск sync: период {date_from}..{date_to}, режим {only}.",
+        reset=True,
+    )
 
     try:
-        log_q.put(("log", f"Старт: период {date_from}..{date_to}, реклама={'нет' if skip_ads else 'да'}, воронка={'нет' if skip_funnel else 'да'}"))
-        log_q.put(("log", f"Команда: {' '.join(cmd)}"))
+        mode_label = {
+            "all": "все данные",
+            "sales": "только продажи",
+            "orders": "только заказы",
+            "stocks": "только остатки",
+            "ads": "только реклама",
+            "funnel": "только воронка",
+        }.get(only, only)
+        _emit_sync_message(log_q, log_paths, "log", f"Старт: период {date_from}..{date_to}, режим: {mode_label}")
+        _emit_sync_message(log_q, log_paths, "log", f"Команда: {' '.join(cmd)}")
+        _emit_sync_message(log_q, log_paths, "log", f"Файл лога: {log_paths[0]}")
         proc = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
@@ -1299,14 +1622,14 @@ def run_sync(date_from: str, date_to: str, skip_ads: bool, skip_funnel: bool, lo
         )
         assert proc.stdout
         for line in proc.stdout:
-            log_q.put(("log", line.rstrip()))
+            _emit_sync_message(log_q, log_paths, "log", line.rstrip())
         proc.wait()
         if proc.returncode == 0:
-            log_q.put(("done", "✅ Готово! Данные загружены."))
+            _emit_sync_message(log_q, log_paths, "done", "✅ Готово! Данные загружены.")
         else:
-            log_q.put(("error", f"❌ Ошибка (код {proc.returncode})"))
+            _emit_sync_message(log_q, log_paths, "error", f"❌ Ошибка (код {proc.returncode})")
     except Exception as exc:
-        log_q.put(("error", f"❌ {exc}"))
+        _emit_sync_message(log_q, log_paths, "error", f"❌ {exc}")
 
 
 HTML = """\
@@ -1332,18 +1655,15 @@ HTML = """\
   input[type=date]:focus {{ border-color: #4f46e5; }}
   .row {{ display: flex; gap: 16px; }}
   .row > div {{ flex: 1; }}
-  .check-row {{ display: flex; align-items: center; gap: 10px; margin-top: 20px; }}
-  .check-row input {{ width: 18px; height: 18px; accent-color: #4f46e5; cursor: pointer; }}
-  .check-row label {{ margin: 0; font-size: .9rem; color: #374151; cursor: pointer; }}
   .quick {{ display: flex; gap: 8px; margin-top: 14px; flex-wrap: wrap; }}
   .quick button {{ margin-top: 0; width: auto; padding: 8px 10px; font-size: .85rem; background: #e5e7eb; color: #111827; }}
   .quick button:hover:not(:disabled) {{ background: #d1d5db; }}
-  .funnel-month {{ margin-top: 12px; }}
-  .funnel-month button {{ margin-top: 0; width: 100%; padding: 11px 12px;
-                          background: #0f766e; color: #fff; border: none;
-                          border-radius: 8px; font-size: .92rem; font-weight: 700;
-                          cursor: pointer; }}
-  .funnel-month button:hover:not(:disabled) {{ background: #115e59; }}
+  .load-grid {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; margin-top: 22px; }}
+  .load-grid button {{ margin-top: 0; }}
+  .load-grid .primary {{ grid-column: 1 / -1; background: #0f766e; }}
+  .load-grid .primary:hover:not(:disabled) {{ background: #115e59; }}
+  .load-grid .secondary {{ background: #4f46e5; }}
+  .load-grid .secondary:hover:not(:disabled) {{ background: #4338ca; }}
   .hint {{ margin-top: 10px; color: #4b5563; font-size: .82rem; }}
   button {{ margin-top: 24px; width: 100%; padding: 13px;
             background: #4f46e5; color: #fff; border: none; border-radius: 8px;
@@ -1391,19 +1711,15 @@ HTML = """\
       <button type="button" data-range="today">Сегодня</button>
       <button type="button" data-range="last7">Последние 7 дней</button>
     </div>
-    <div class="check-row">
-      <input type="checkbox" id="skip_ads" name="skip_ads">
-      <label for="skip_ads">Пропустить рекламу (быстрее)</label>
+    <div class="load-grid">
+      <button type="button" class="primary" data-load-mode="all">▶ Загрузить всё</button>
+      <button type="button" class="secondary" data-load-mode="sales">Продажи</button>
+      <button type="button" class="secondary" data-load-mode="orders">Заказы</button>
+      <button type="button" class="secondary" data-load-mode="stocks">Остатки</button>
+      <button type="button" class="secondary" data-load-mode="ads">Реклама</button>
+      <button type="button" class="secondary" data-load-mode="funnel">Воронка</button>
     </div>
-    <div class="check-row">
-      <input type="checkbox" id="skip_funnel" name="skip_funnel">
-      <label for="skip_funnel">Пропустить воронку продаж (быстрее)</label>
-    </div>
-    <div class="funnel-month">
-      <button type="button" id="btn-funnel-month">Обновить воронку за последний месяц</button>
-    </div>
-    <div class="hint">Загрузка пишет данные в SQLite: продажи, заказы, реклама, PnL, воронка.</div>
-    <button type="submit" id="btn">▶ Загрузить</button>
+    <div class="hint">Все загрузки идут по всему кабинету. Разделение “наши / не наши” применяется только в отчетах.</div>
   </form>
   <div class="db-link"><a href="/db">Открыть таблицы SQLite</a></div>
   <div class="reports-links">
@@ -1418,7 +1734,7 @@ HTML = """\
 </div>
 <script>
 const form = document.getElementById('form');
-const btn  = document.getElementById('btn');
+const loadButtons = [...document.querySelectorAll('[data-load-mode]')];
 const logEl = document.getElementById('log');
 const logWrap = document.getElementById('log-wrap');
 const statusEl = document.getElementById('status');
@@ -1456,51 +1772,34 @@ for (const quickBtn of document.querySelectorAll('.quick button[data-range]')) {
   }});
 }}
 
-// Кнопка для обновления воронки за последний месяц
-const funnelMonthBtn = document.getElementById('btn-funnel-month');
-if (funnelMonthBtn) {{
-  funnelMonthBtn.addEventListener('click', () => {{
-    const today = new Date();
-    const monthAgo = new Date(today);
-    monthAgo.setDate(monthAgo.getDate() - 30);
-    dfEl.value = isoDate(monthAgo);
-    dtEl.value = isoDate(today);
-    // Автоматически пропускаем рекламу для ускорения
-    document.getElementById('skip_ads').checked = true;
-    // Убеждаемся, что воронка НЕ пропускается
-    document.getElementById('skip_funnel').checked = false;
-  }});
-}}
-
 function appendLog(text) {{
   logEl.textContent += text + '\\n';
   logEl.scrollTop = logEl.scrollHeight;
 }}
 
-form.addEventListener('submit', async e => {{
-  e.preventDefault();
+async function startLoad(mode) {{
   const df = dfEl.value;
   const dt = dtEl.value;
-  const skipAds = document.getElementById('skip_ads').checked ? '1' : '0';
-  const skipFunnel = document.getElementById('skip_funnel').checked ? '1' : '0';
+  const activeButton = loadButtons.find(button => button.dataset.loadMode === mode);
 
-  btn.disabled = true;
-  btn.textContent = '⏳ Загружаю...';
+  loadButtons.forEach(button => button.disabled = true);
+  const oldText = activeButton ? activeButton.textContent : '';
+  if (activeButton) activeButton.textContent = '⏳ Загружаю...';
   logEl.textContent = '';
   statusEl.textContent = '';
   statusEl.className = 'status';
   logWrap.style.display = 'block';
-  appendLog(`Запрос отправлен: ${{df}}..${{dt}}` + (skipAds === '1' ? ' (без рекламы)' : '') + (skipFunnel === '1' ? ' (без воронки)' : ''));
-  appendLog('Таблицы: raw_stocks + buyout_order_day + finance_article_day_detail + analytics_article_day + analytics_day + analytics_article_period');
+  appendLog(`Запрос отправлен: ${{df}}..${{dt}}, режим: ${{mode}}`);
+  appendLog('Загрузка всегда идет по всему кабинету.');
   statusEl.textContent = 'Выполняется...';
 
-  const url = `/stream?date_from=${{df}}&date_to=${{dt}}&skip_ads=${{skipAds}}&skip_funnel=${{skipFunnel}}`;
+  const url = `/stream?date_from=${{df}}&date_to=${{dt}}&mode=${{encodeURIComponent(mode)}}`;
   const resp = await fetch(url);
   if (!resp.ok || !resp.body) {{
     statusEl.textContent = `❌ Не удалось открыть поток логов (HTTP ${{resp.status}})`;
     statusEl.className = 'status err';
-    btn.disabled = false;
-    btn.textContent = '▶ Загрузить';
+    loadButtons.forEach(button => button.disabled = false);
+    if (activeButton) activeButton.textContent = oldText;
     return;
   }}
   const reader = resp.body.getReader();
@@ -1531,9 +1830,16 @@ form.addEventListener('submit', async e => {{
     }}
   }}
 
-  btn.disabled = false;
-  btn.textContent = '▶ Загрузить';
+  loadButtons.forEach(button => button.disabled = false);
+  if (activeButton) activeButton.textContent = oldText;
+}}
+
+form.addEventListener('submit', e => {{
+  e.preventDefault();
 }});
+for (const button of loadButtons) {{
+  button.addEventListener('click', () => startLoad(button.dataset.loadMode || 'all'));
+}}
 </script>
 </body>
 </html>
@@ -1639,10 +1945,10 @@ BUYOUT_ORDER_DAY_HTML = """\
     .quick-range {{ display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }}
     .quick-range button {{ padding: 7px 10px; background: #e6f4f1; color: var(--accent); }}
     .meta {{ margin-top: 8px; color: var(--muted); font-size: .78rem; }}
-    .workspace {{ --articles-width: 336px; display: grid; grid-template-columns: var(--articles-width) minmax(0, 1fr); gap: 12px; align-items: start; margin-top: 10px; }}
+    .workspace {{ --articles-width: 332px; display: grid; grid-template-columns: var(--articles-width) minmax(0, 1fr); gap: 12px; align-items: start; margin-top: 10px; }}
     .workspace.articles-collapsed {{ --articles-width: 44px; }}
     .main-pane {{ display: flex; flex-direction: column; gap: 12px; min-width: 0; }}
-    .tbl {{ --graph-col-width: 58px; --metric-col-width: 240px; --total-col-width: 120px; background: #fff; border: 1px solid #e5e7eb; border-radius: 12px; overflow-x: auto; overflow-y: auto; max-height: calc(100vh - 230px); -webkit-overflow-scrolling: touch; }}
+    .tbl {{ --graph-col-width: 58px; --metric-col-width: 240px; --total-col-width: 120px; background: #fff; border: 1px solid #e5e7eb; border-radius: 12px; overflow-x: auto; -webkit-overflow-scrolling: touch; }}
     .articles {{ position: relative; background: #fff; border: 1px solid #e5e7eb; border-radius: 12px; overflow: hidden; max-height: calc(100vh - 230px); display: flex; flex-direction: column; min-width: 0; transition: width .18s ease, box-shadow .18s ease, border-color .18s ease; }}
     .articles-inner {{ display: flex; flex-direction: column; min-height: 0; height: 100%; background: #fff; }}
     .articles-head {{ padding: 7px 8px; border-bottom: 1px solid #eef2f7; display: flex; justify-content: space-between; gap: 8px; align-items: center; }}
@@ -1655,12 +1961,13 @@ BUYOUT_ORDER_DAY_HTML = """\
     .subject-filter label {{ font-size: .68rem; margin-bottom: 2px; }}
     .subject-filter select {{ width: 100%; min-width: 0; padding: 5px 6px; font-size: .72rem; }}
     .article-list {{ overflow: auto; user-select: none; }}
-    .article-table {{ width: 100%; border-collapse: collapse; table-layout: fixed; font-size: 10px; }}
-    .article-table th, .article-table td {{ border-bottom: 1px solid #eef2f7; padding: 3px 5px; line-height: 1.15; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
+    .article-table {{ width: auto; min-width: 100%; border-collapse: collapse; table-layout: fixed; font-size: 10px; }}
+    .article-table th, .article-table td {{ border-bottom: 1px solid #eef2f7; padding: 3px 4px; line-height: 1.15; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
     .article-table th {{ position: sticky; top: 0; z-index: 1; background: #f8fafc; color: #475569; font-size: .62rem; cursor: pointer; }}
-    .article-table th:first-child, .article-table td:first-child {{ text-align: left; width: 112px; }}
-    .article-table th:nth-child(2), .article-table td:nth-child(2) {{ text-align: right; width: 58px; }}
-    .article-table th:nth-child(3), .article-table td:nth-child(3) {{ text-align: right; }}
+    .article-table th:first-child, .article-table td:first-child {{ text-align: left; width: 108px; }}
+    .article-table th:nth-child(2), .article-table td:nth-child(2) {{ text-align: right; width: 48px; }}
+    .article-table th:nth-child(3), .article-table td:nth-child(3) {{ text-align: right; width: 50px; }}
+    .article-table th:nth-child(4), .article-table td:nth-child(4) {{ text-align: right; width: 78px; }}
     .article-table tr {{ cursor: default; }}
     .article-table tbody tr:hover {{ background: #f0fdfa; }}
     .article-table tbody tr.selected {{ background: #ccfbf1; font-weight: 800; color: #115e59; }}
@@ -1685,10 +1992,15 @@ BUYOUT_ORDER_DAY_HTML = """\
     .chart-head {{ display: flex; justify-content: space-between; align-items: center; gap: 10px; margin-bottom: 10px; }}
     .chart-title {{ font-size: .95rem; font-weight: 800; }}
     .chart-subtitle {{ color: var(--muted); font-size: .74rem; }}
+    .chart-legend {{ display: flex; flex-wrap: wrap; gap: 8px 14px; margin: 0 0 10px; }}
+    .chart-legend-item {{ display: inline-flex; align-items: center; gap: 7px; padding: 5px 9px; border: 1px solid #dbeafe; border-radius: 999px; background: #f8fafc; color: #0f172a; font-size: .78rem; font-weight: 600; }}
     .chart-swatch {{ width: 10px; height: 10px; border-radius: 999px; flex: 0 0 auto; }}
     .chart-empty {{ color: var(--muted); font-size: .78rem; padding: 14px 0 4px; }}
     .chart-svg-wrap {{ position: relative; width: 100%; overflow-x: auto; border: 1px solid #eef2f7; border-radius: 10px; background: linear-gradient(180deg, #fcfffe, #f8fafc); }}
+    .chart-svg-wrap[data-fit-width="1"] {{ overflow-x: hidden; }}
     .chart-svg {{ display: block; min-width: var(--chart-min-width, 980px); width: 100%; height: var(--chart-height, 860px); }}
+    .chart-svg-wrap[data-fit-width="0"] .chart-svg {{ width: var(--chart-min-width, 980px); height: auto; aspect-ratio: var(--chart-aspect-ratio, 980 / 860); }}
+    .chart-svg-wrap[data-fit-width="1"] .chart-svg {{ min-width: 0; height: auto; aspect-ratio: var(--chart-aspect-ratio, 980 / 860); }}
     .chart-axis {{ stroke: #cbd5e1; stroke-width: 1; }}
     .chart-grid {{ stroke: #e5e7eb; stroke-width: 1; stroke-dasharray: 3 4; }}
     .chart-label {{ fill: #64748b; font-size: var(--chart-font-size, 11px); }}
@@ -1708,7 +2020,7 @@ BUYOUT_ORDER_DAY_HTML = """\
     .workspace.articles-collapsed .articles .articles-inner {{ display: none; }}
     .workspace.articles-collapsed .articles .articles-mini {{ display: flex; }}
     .workspace.articles-collapsed .articles:hover,
-    .workspace.articles-collapsed .articles:focus-within {{ width: 336px; z-index: 20; box-shadow: 0 18px 40px rgba(15, 118, 110, .18); border-color: #99f6e4; }}
+    .workspace.articles-collapsed .articles:focus-within {{ width: 332px; z-index: 20; box-shadow: 0 18px 40px rgba(15, 118, 110, .18); border-color: #99f6e4; }}
     .workspace.articles-collapsed .articles:hover .articles-inner,
     .workspace.articles-collapsed .articles:focus-within .articles-inner {{ display: flex; }}
     .workspace.articles-collapsed .articles:hover .articles-mini,
@@ -1784,6 +2096,7 @@ BUYOUT_ORDER_DAY_HTML = """\
               <div class="chart-subtitle">Суммы и проценты на одном графике. Проценты вынесены ниже и масштабируются отдельно.</div>
             </div>
           </div>
+          <div class="chart-legend" id="chart-legend"></div>
           <div class="chart-svg-wrap" id="chart-wrap"></div>
         </section>
       </div>
@@ -1794,6 +2107,7 @@ const meta = document.getElementById('meta');
 const tbl = document.getElementById('tbl');
 const articleList = document.getElementById('article-list');
 const subjectEl = document.getElementById('subject');
+const chartLegend = document.getElementById('chart-legend');
 const chartWrap = document.getElementById('chart-wrap');
 const workspaceEl = document.getElementById('workspace');
 const reportGranularity = '{granularity}';
@@ -1930,6 +2244,8 @@ function renderChart(data) {{
   const selectedRows = rows.filter(row => activeChartMetrics.has(row.metric));
   const dates = data.dates || [];
   if (!dates.length || !selectedRows.length) {{
+    chartLegend.innerHTML = '';
+    chartWrap.dataset.fitWidth = '0';
     chartWrap.innerHTML = '<div class="chart-empty">Выберите хотя бы одну метрику с данными.</div>';
     return;
   }}
@@ -1977,6 +2293,11 @@ function renderChart(data) {{
 
   const width = chartConfig.minWidth;
   const height = chartConfig.height;
+  const preserveAspectRatio = 'xMidYMid meet';
+  // Явно задаем размер SVG, чтобы контейнер не растягивал недельный график.
+  const svgInlineStyle = isWeekChart
+    ? `width:${{width}}px;height:auto;display:block`
+    : 'width:100%;height:auto;display:block';
   const left = chartConfig.left;
   const right = chartConfig.right;
   const top = chartConfig.top;
@@ -2032,6 +2353,16 @@ function renderChart(data) {{
       <text class="chart-label" x="${{x}}" y="${{height - 18}}" text-anchor="end" transform="rotate(-45 ${{x}} ${{height - 18}})">${{formatDate(day)}}</text>
     `;
   }}).join('');
+  const allSeries = selectedRows.map((row, idx) => ({{
+    row,
+    color: chartPalette[idx % chartPalette.length],
+  }}));
+  const legendHtml = allSeries.map(series => `
+    <div class="chart-legend-item">
+      <span class="chart-swatch" style="background:${{series.color}}"></span>
+      <span>${{escapeHtml(series.row.metric)}}</span>
+    </div>
+  `).join('');
 
   const seriesSvg = selectedRows.map((row, idx) => {{
     const isPercent = String(row.kind || '').startsWith('percent');
@@ -2069,13 +2400,16 @@ function renderChart(data) {{
 
   chartWrap.style.setProperty('--chart-min-width', `${{width}}px`);
   chartWrap.style.setProperty('--chart-height', `${{height}}px`);
+  chartWrap.style.setProperty('--chart-aspect-ratio', `${{width}} / ${{height}}`);
   chartWrap.style.setProperty('--chart-font-size', `${{chartConfig.fontSize}}px`);
   chartWrap.style.setProperty('--chart-zone-font-size', `${{chartConfig.zoneFontSize}}px`);
   chartWrap.style.setProperty('--chart-line-width', `${{chartConfig.lineWidth}}`);
   chartWrap.style.setProperty('--chart-dot-stroke', `${{chartConfig.dotStroke}}`);
+  chartWrap.dataset.fitWidth = isWeekChart ? '0' : '1';
+  chartLegend.innerHTML = legendHtml;
   chartWrap.innerHTML = `
     <div class="chart-tooltip" id="chart-tooltip"></div>
-    <svg class="chart-svg" viewBox="0 0 ${{width}} ${{height}}" preserveAspectRatio="none">
+    <svg class="chart-svg" style="${{svgInlineStyle}}" viewBox="0 0 ${{width}} ${{height}}" preserveAspectRatio="${{preserveAspectRatio}}">
       <text class="chart-zone-label" x="${{left}}" y="${{moneyTop - 6}}">Суммы</text>
       <text class="chart-zone-label" x="${{left}}" y="${{percentTop - 6}}">Проценты</text>
       <line class="chart-axis" x1="${{left}}" y1="${{moneyTop}}" x2="${{left}}" y2="${{moneyBottom}}"></line>
@@ -2093,10 +2427,6 @@ function renderChart(data) {{
   const svgEl = chartWrap.querySelector('.chart-svg');
   const tooltipEl = document.getElementById('chart-tooltip');
   const hoverLineEl = document.getElementById('chart-hover-line');
-  const allSeries = selectedRows.map((row, idx) => ({{
-    row,
-    color: chartPalette[idx % chartPalette.length],
-  }}));
   const showTooltip = (index, clientX, clientY) => {{
     const x = left + xStep * index;
     hoverLineEl.setAttribute('x1', String(x));
@@ -2141,6 +2471,15 @@ function renderChart(data) {{
 
 function cellColorStyle(kind, prevRaw, currRaw, row) {{
   if (prevRaw === null || prevRaw === undefined || currRaw === null || currRaw === undefined) return '';
+  if (String(row?.metric || '') === 'СПП') {{
+    const diff = currRaw - prevRaw;
+    const threshold = Number(row?.color_threshold ?? 1);
+    // Для СПП подсветка должна включаться уже при изменении ровно на порог.
+    if (Math.abs(diff) < threshold) return '';
+    return diff > 0
+      ? 'color:#047857;font-weight:900;text-shadow:0 0 0 #047857'
+      : 'color:#b91c1c;font-weight:900;text-shadow:0 0 0 #b91c1c';
+  }}
   const isPercent = kind === 'percent_income' || kind === 'percent_expense';
   const threshold = Number(row?.color_threshold ?? (isPercent ? 5 : 10));
   const colorMode = row?.color_mode || (isPercent ? 'absolute' : 'percent');
@@ -2168,12 +2507,24 @@ function isHeatmapMetric(row) {{
   const metric = String(row?.metric || '');
   const group = String(row?.group || '');
   const kind = String(row?.kind || '');
+  if (metric === 'СПП') return true;
   if (group === 'Воронка' && kind === 'percent_income') return true;
   return metric === 'ДРР от выкупов в эту дату' || metric === 'Маржинальность от выкупов за дату';
 }}
 
 function heatmapCellStyle(row, raw) {{
   if (!isHeatmapMetric(row) || raw === null || raw === undefined || !Number.isFinite(raw)) return '';
+  if (String(row?.metric || '') === 'СПП') {{
+    const values = (row?.raw_values || []).filter(value => Number.isFinite(value));
+    if (!values.length) return '';
+    const min = Math.min(...values);
+    const max = Math.max(...values);
+    const span = max - min;
+    const score = span > 0 ? (raw - min) / span : 1;
+    const hue = Math.round(8 + score * 132);
+    const lightness = Math.round(96 - score * 14);
+    return `background:hsl(${{hue}} 58% ${{lightness}}%);color:#0f172a;font-weight:700`;
+  }}
   const values = (row?.raw_values || []).filter(value => Number.isFinite(value));
   if (!values.length) return '';
   const min = Math.min(...values);
@@ -2228,9 +2579,12 @@ function render(data) {{
         const checked = activeChartMetrics.has(row.metric) ? ' checked' : '';
         const cells = (row.values || []).map((v, i) => {{
           const heatmapStyle = heatmapCellStyle(row, rawVals[i]);
-          const style = heatmapStyle || ((kind !== 'none' && kind !== 'neutral' && i > 0)
+          const changeStyle = (kind !== 'none' && kind !== 'neutral' && i > 0)
             ? cellColorStyle(kind, rawVals[i - 1], rawVals[i], row)
-            : '');
+            : '';
+          const style = heatmapStyle && changeStyle && String(row.metric || '') === 'СПП'
+            ? `${{heatmapStyle}};${{changeStyle}}`
+            : (heatmapStyle || changeStyle);
           return style ? `<td style="${{style}}">${{v}}</td>` : `<td>${{v}}</td>`;
         }}).join('');
         const hiddenAttr = groupCollapsed ? ' hidden' : '';
@@ -2264,7 +2618,7 @@ function render(data) {{
 
 function renderArticles(articles) {{
   const normalized = articles.map(item => typeof item === 'string'
-    ? {{ article: item, nmid: '', stock: null, revenue: 0 }}
+    ? {{ article: item, nmid: '', stock: null, buyouts: 0, revenue: 0, wb_buyout_pct: null }}
     : item
   );
   articleItems = [...normalized].sort((left, right) => {{
@@ -2281,6 +2635,7 @@ function renderArticles(articles) {{
         <thead><tr>
           <th data-sort="article">Артикул${{sortMark('article')}}</th>
           <th data-sort="stock">Ост.${{sortMark('stock')}}</th>
+          <th data-sort="wb_buyout_pct">% выкупа${{sortMark('wb_buyout_pct')}}</th>
           <th data-sort="revenue">Выручка${{sortMark('revenue')}}</th>
         </tr></thead>
 	        <tbody>${{articleItems.map(item => {{
@@ -2292,9 +2647,11 @@ function renderArticles(articles) {{
           const wbLink = /^\d+$/.test(nmid)
             ? `<a class="article-link" href="https://www.wildberries.ru/catalog/${{nmid}}/detail.aspx" target="_blank" rel="noopener noreferrer" title="Открыть товар на WB" data-skip-select="1">↗</a>`
             : '';
+          const pct = item.wb_buyout_pct != null ? Math.round(item.wb_buyout_pct) + '%' : '—';
 	          return `<tr class="article-item${{selected}}" data-article="${{safeArticle}}" data-key="${{escapeHtml(itemKey)}}" title="${{safeArticle}}">
 	            <td>${{safeArticle}}${{wbLink}}</td>
             <td>${{formatCompactNumber(item.stock)}}</td>
+            <td>${{pct}}</td>
             <td>${{formatCompactNumber(item.revenue)}}</td>
           </tr>`;
         }}).join('')}}</tbody>
@@ -2342,12 +2699,13 @@ function renderArticles(articles) {{
 async function loadSubjects() {{
   const df = document.getElementById('df').value;
   const dt = document.getElementById('dt').value;
-  const key = `${{df}}..${{dt}}`;
+  const scope = window.getGlobalScope ? window.getGlobalScope() : 'ours';
+  const key = `${{df}}..${{dt}}..${{scope}}`;
   if (key === subjectsLoadedFor) return;
   subjectsLoadedFor = key;
   const current = subjectEl.dataset.pendingValue !== undefined ? subjectEl.dataset.pendingValue : subjectEl.value;
   delete subjectEl.dataset.pendingValue;
-  const qs = new URLSearchParams({{ date_from: df, date_to: dt }});
+  const qs = new URLSearchParams({{ date_from: df, date_to: dt, scope }});
   const res = await fetch(`/api/analytics/buyout-subjects?${{qs.toString()}}`);
   const data = await res.json();
   const subjects = data.subjects || [];
@@ -2361,15 +2719,21 @@ async function loadSubjects() {{
 async function loadArticles() {{
   const df = document.getElementById('df').value;
   const dt = document.getElementById('dt').value;
+  const scope = window.getGlobalScope ? window.getGlobalScope() : 'ours';
   await loadSubjects();
   const subject = subjectEl.value;
-  const key = `${{df}}..${{dt}}..${{subject}}`;
+  const key = `${{df}}..${{dt}}..${{subject}}..${{scope}}`;
   if (key === articlesLoadedFor) return;
   articlesLoadedFor = key;
-  const qs = new URLSearchParams({{ date_from: df, date_to: dt, subject }});
+  const qs = new URLSearchParams({{ date_from: df, date_to: dt, subject, scope }});
   const res = await fetch(`/api/analytics/buyout-articles?${{qs.toString()}}`);
   const data = await res.json();
-  renderArticles(data.articles || []);
+  const articles = data.articles || [];
+  if (selectedArticles.size) {{
+    const available = new Set(articles.map(item => String((item && (item.nmid || item.article)) || '').trim()).filter(Boolean));
+    selectedArticles = new Set([...selectedArticles].filter(item => available.has(item)));
+  }}
+  renderArticles(articles);
 }}
 
 async function loadData() {{
@@ -2381,7 +2745,7 @@ async function loadData() {{
   const subject = subjectEl.value;
   meta.textContent = 'Загружаю...';
   await loadArticles();
-  const qs = new URLSearchParams({{ article, date_from: df, date_to: dt, subject, granularity: reportGranularity }});
+  const qs = new URLSearchParams({{ article, date_from: df, date_to: dt, subject, granularity: reportGranularity, scope: window.getGlobalScope ? window.getGlobalScope() : 'ours' }});
   for (const articleName of selectedArticles) qs.append('articles', articleName);
   const res = await fetch(`/api/analytics/buyout-order-day?${{qs.toString()}}`);
   const data = await res.json();
@@ -2406,11 +2770,7 @@ subjectEl.addEventListener('change', () => {{
 document.getElementById('df').addEventListener('change', () => {{ subjectsLoadedFor = ''; articlesLoadedFor = ''; loadData(); }});
 document.getElementById('dt').addEventListener('change', () => {{ subjectsLoadedFor = ''; articlesLoadedFor = ''; loadData(); }});
 document.getElementById('select-all').addEventListener('click', async () => {{
-  const df = document.getElementById('df').value;
-  const dt = document.getElementById('dt').value;
-  articlesLoadedFor = '';
-  await loadArticles();
-	  for (const item of articleItems) selectedArticles.add(String(item.nmid || item.article || '').trim());
+  selectedArticles.clear();
   saveFilters();
   articlesLoadedFor = '';
   await loadArticles();
@@ -2550,7 +2910,7 @@ async function loadData() {{
   const df = document.getElementById('df').value;
   const dt = document.getElementById('dt').value;
   meta.textContent = 'Загружаю...';
-  const res = await fetch(`/api/analytics/day?date_from=${{encodeURIComponent(df)}}&date_to=${{encodeURIComponent(dt)}}`);
+  const res = await fetch(`/api/analytics/day?date_from=${{encodeURIComponent(df)}}&date_to=${{encodeURIComponent(dt)}}&scope=${{encodeURIComponent(window.getGlobalScope ? window.getGlobalScope() : 'ours')}}`);
   const data = await res.json();
   if (seq !== requestSeq) return;
   renderSummary(data.summary || {{}});
@@ -2670,7 +3030,7 @@ async function loadData() {{
   const df = document.getElementById('df').value;
   const dt = document.getElementById('dt').value;
   meta.textContent = 'Загружаю...';
-  const qs = new URLSearchParams({{ article, date_from: df, date_to: dt }});
+  const qs = new URLSearchParams({{ article, date_from: df, date_to: dt, scope: window.getGlobalScope ? window.getGlobalScope() : 'ours' }});
   const res = await fetch(`/api/analytics/period?${{qs.toString()}}`);
   const data = await res.json();
   if (seq !== requestSeq) return;
@@ -2800,7 +3160,7 @@ async function loadData() {{
   const df = document.getElementById('df').value;
   const dt = document.getElementById('dt').value;
   meta.textContent = 'Загружаю...';
-  const qs = new URLSearchParams({{ article, date_from: df, date_to: dt }});
+  const qs = new URLSearchParams({{ article, date_from: df, date_to: dt, scope: window.getGlobalScope ? window.getGlobalScope() : 'ours' }});
   const res = await fetch(`/api/analytics/article-day?${{qs.toString()}}`);
   const data = await res.json();
   if (seq !== requestSeq) return;
@@ -2942,7 +3302,7 @@ async function loadData() {{
   const df = document.getElementById('df').value;
   const dt = document.getElementById('dt').value;
   meta.textContent = 'Загружаю...';
-  const qs = new URLSearchParams({{ article, date_from: df, date_to: dt, buyout_percent: buyout }});
+  const qs = new URLSearchParams({{ article, date_from: df, date_to: dt, buyout_percent: buyout, scope: window.getGlobalScope ? window.getGlobalScope() : 'ours' }});
   const res = await fetch(`/api/analytics/preliminary-economics?${{qs.toString()}}`);
   const data = await res.json();
   if (seq !== requestSeq) return;
@@ -3088,7 +3448,7 @@ async function loadData() {{
   const df = document.getElementById('df').value;
   const dt = document.getElementById('dt').value;
   meta.textContent = 'Загружаю...';
-  const qs = new URLSearchParams({{ article, date_from: df, date_to: dt, buyout_percent: buyout, aggregate: '1' }});
+  const qs = new URLSearchParams({{ article, date_from: df, date_to: dt, buyout_percent: buyout, aggregate: '1', scope: window.getGlobalScope ? window.getGlobalScope() : 'ours' }});
   const res = await fetch(`/api/analytics/preliminary-economics?${{qs.toString()}}`);
   const data = await res.json();
   if (seq !== requestSeq) return;
@@ -3243,6 +3603,13 @@ def _import_funnel_excel(path: str, source_name: str) -> dict[str, object]:
     raise ValueError("Не нашёл заголовки: нужны 'Артикул WB', 'Дата', 'Показы', 'Переходы в карточку'")
 
   idx = {header: pos for pos, header in enumerate(headers) if header}
+  def first_col(*names: str) -> int | None:
+    for name in names:
+      if name in idx:
+        return idx[name]
+    return None
+
+  order_count_idx = first_col("Заказали, шт", "Заказали товаров, шт")
   rows: list[tuple[str, str, str, str, str, str, str, str, str]] = []
   funnel_rows: list[dict[str, str]] = []
   dates: set[str] = set()
@@ -3258,7 +3625,7 @@ def _import_funnel_excel(path: str, source_name: str) -> dict[str, object]:
     impressions = _decimal_text(row[idx["Показы"]])
     transitions = _decimal_text(row[idx["Переходы в карточку"]])
     cart_count = _decimal_text(row[idx["Положили в корзину"]]) if "Положили в корзину" in idx else "0"
-    order_count = _decimal_text(row[idx["Заказали, шт"]]) if "Заказали, шт" in idx else "0"
+    order_count = _decimal_text(row[order_count_idx]) if order_count_idx is not None else "0"
     buyout_count = _decimal_text(row[idx["Выкупили, шт"]]) if "Выкупили, шт" in idx else "0"
     supplier_article = _cell_text(row[idx["Артикул продавца"]]) if "Артикул продавца" in idx else ""
     product_name = _cell_text(row[idx["Название"]]) if "Название" in idx else ""
@@ -3381,9 +3748,6 @@ def _rebuild_buyout_order_day_from_store() -> int:
   from wb_gsheets.transform import (
     build_buyout_order_day_rows,
     build_nm_mapping,
-    extract_filter_values,
-    extract_orders_filters,
-    filter_sales_rows,
     sheet_values_to_dicts,
   )
 
@@ -3391,39 +3755,14 @@ def _rebuild_buyout_order_day_from_store() -> int:
   store = SQLiteStore(DB_PATH)
   sku_values = store.get_values(settings.cogs_sheet)
   nm_mapping = build_nm_mapping(sku_values, article_filter_type=settings.article_filter_type)
-  allowed_nm = {str(nm_id).strip() for nm_id in nm_mapping.keys() if str(nm_id).strip()}
-  article_filter_values = settings.article_filter_values or extract_filter_values(
-    sku_values,
-    article_filter_type=settings.article_filter_type,
-  )
-  orders_supplier_articles, _orders_nm_ids = extract_orders_filters(sku_values)
-
   sales_rows = sheet_values_to_dicts(store.get_values(settings.raw_sales_sheet))
-  if article_filter_values or nm_mapping:
-    sales_rows = filter_sales_rows(
-      sales_rows,
-      article_filter_type=settings.article_filter_type,
-      article_filter_values=article_filter_values,
-      nm_id_filter_values=allowed_nm,
-    )
-
-  orders_rows = []
-  for row in sheet_values_to_dicts(store.get_values(settings.raw_orders_sheet)):
-    nm_id = str(row.get("nmId", "")).strip()
-    supplier_article = str(row.get("supplierArticle", "")).strip()
-    if allowed_nm and nm_id not in allowed_nm:
-      continue
-    if not allowed_nm and orders_supplier_articles and supplier_article not in orders_supplier_articles:
-      continue
-    orders_rows.append(row)
+  orders_rows = sheet_values_to_dicts(store.get_values(settings.raw_orders_sheet))
 
   funnel_by_nm: dict[str, dict[str, object]] = {}
   for row in sheet_values_to_dicts(store.get_values(settings.funnel_analytics_sheet)):
     nm_id = str(row.get("nmId", "")).strip()
     row_date = str(row.get("date", "")).strip()
     if not nm_id or not row_date:
-      continue
-    if allowed_nm and nm_id not in allowed_nm:
       continue
     entry = funnel_by_nm.setdefault(nm_id, {
       "currency": str(row.get("currency", "") or "RUB"),
@@ -3454,7 +3793,7 @@ def _rebuild_buyout_order_day_from_store() -> int:
   return max(0, len(rows) - 1)
 
 
-def _render_db_page(selected_table: str | None, page: int, page_size: int) -> bytes:
+def _render_db_page(selected_table: str | None, page: int, page_size: int, scope: str = DEFAULT_SCOPE) -> bytes:
     store = db_store()
     existing_tables = store.list_tables()
     tables = list(dict.fromkeys(CORE_TABLES + existing_tables))
@@ -3467,7 +3806,27 @@ def _render_db_page(selected_table: str | None, page: int, page_size: int) -> by
 
     if current_table and table_exists:
         offset = max(page - 1, 0) * page_size
-        headers, rows, total = store.fetch_table_page(current_table, page_size, offset)
+        with _db_connect() as conn:
+            safe_table = (current_table or "").replace('"', '""')
+            table_info = conn.execute(f'PRAGMA table_info("{safe_table}")').fetchall()
+            columns = [str(row["name"]) for row in table_info]
+            scope_where, scope_params = _db_scope_filter(conn, current_table, scope)
+            if columns:
+                headers = columns
+                total = int(
+                    conn.execute(
+                        f"SELECT COUNT(*) AS cnt FROM {_sql_ident(current_table)} {scope_where}",
+                        scope_params,
+                    ).fetchone()["cnt"]
+                )
+                select_cols = ", ".join(_sql_ident(col) for col in headers)
+                rows = [
+                    ["" if row[col] is None else str(row[col]) for col in headers]
+                    for row in conn.execute(
+                        f"SELECT {select_cols} FROM {_sql_ident(current_table)} {scope_where} LIMIT ? OFFSET ?",
+                        [*scope_params, page_size, offset],
+                    ).fetchall()
+                ]
 
     total_pages = max(1, ceil(total / page_size)) if current_table else 1
     page = min(max(page, 1), total_pages)
@@ -3481,7 +3840,7 @@ def _render_db_page(selected_table: str | None, page: int, page_size: int) -> by
         table_q = quote_plus(table)
         suffix = "" if table in existing_set else " (пусто)"
         nav_items.append(
-            f'<a class="tbl {cls}" href="/db?table={table_q}&page=1">{escape(table)}{escape(suffix)}</a>'
+            f'<a class="tbl {cls}" href="{escape(_with_scope(f"/db?table={table_q}&page=1", scope))}">{escape(table)}{escape(suffix)}</a>'
         )
     nav_html = "".join(nav_items)
 
@@ -3534,8 +3893,8 @@ def _render_db_page(selected_table: str | None, page: int, page_size: int) -> by
     if current_table and table_exists:
         pager = (
             '<div class="pager">'
-            f'<a href="/db?table={selected_q}&page={prev_page}">← Назад</a>'
-            f'<a href="/db?table={selected_q}&page={next_page}">Вперед →</a>'
+            f'<a href="{escape(_with_scope(f"/db?table={selected_q}&page={prev_page}", scope))}">← Назад</a>'
+            f'<a href="{escape(_with_scope(f"/db?table={selected_q}&page={next_page}", scope))}">Вперед →</a>'
             "</div>"
         )
 
@@ -3576,7 +3935,10 @@ def _render_db_page(selected_table: str | None, page: int, page_size: int) -> by
 <body>
   <div class="top">
     <strong>SQLite: {escape(DB_PATH)}</strong>
-    <a href="/">← К синхронизации</a>
+    <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+      {_scope_control_html(scope)}
+      <a href="{escape(_with_scope('/', scope))}">← К синхронизации</a>
+    </div>
   </div>
   <div class="layout">
     <aside class="side">{nav_html}</aside>
@@ -3641,6 +4003,8 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         parsed = urlparse(self.path)
+        params = parse_qs(parsed.query)
+        scope = _normalize_scope((params.get("scope") or [DEFAULT_SCOPE])[0])
 
         if parsed.path == "/":
             today = date.today()
@@ -3648,8 +4012,8 @@ class Handler(BaseHTTPRequestHandler):
             body = HTML.format(
                 date_from=week_ago.isoformat(),
                 date_to=today.isoformat(),
-                report_links=REPORT_LINKS_HTML,
-                table_links=_render_table_links_html(),
+                report_links=_report_links_html(scope),
+                table_links=_render_table_links_html(scope),
             ).encode()
             self._send_html(body)
 
@@ -3662,7 +4026,7 @@ class Handler(BaseHTTPRequestHandler):
             body = ANALYTICS_PERIOD_HTML.format(
                 date_from=week_ago.isoformat(),
                 date_to=today.isoformat(),
-                report_nav=REPORT_NAV_HTML,
+                report_nav=_report_nav_html(scope),
             ).encode("utf-8")
             self._send_html(body)
 
@@ -3672,7 +4036,7 @@ class Handler(BaseHTTPRequestHandler):
             body = ANALYTICS_DAY_HTML.format(
                 date_from=week_ago.isoformat(),
                 date_to=today.isoformat(),
-                report_nav=REPORT_NAV_HTML,
+                report_nav=_report_nav_html(scope),
             ).encode("utf-8")
             self._send_html(body)
 
@@ -3682,7 +4046,7 @@ class Handler(BaseHTTPRequestHandler):
             body = ANALYTICS_ARTICLE_DAY_HTML.format(
                 date_from=week_ago.isoformat(),
                 date_to=today.isoformat(),
-                report_nav=REPORT_NAV_HTML,
+                report_nav=_report_nav_html(scope),
             ).encode("utf-8")
             self._send_html(body)
 
@@ -3692,7 +4056,7 @@ class Handler(BaseHTTPRequestHandler):
             body = BUYOUT_ORDER_DAY_HTML.format(
                 date_from=month_ago.isoformat(),
                 date_to=today.isoformat(),
-                report_nav=REPORT_NAV_HTML,
+                report_nav=_report_nav_html(scope),
                 page_title="Выкупы по датам заказов",
                 granularity="day",
             ).encode("utf-8")
@@ -3704,7 +4068,7 @@ class Handler(BaseHTTPRequestHandler):
             body = BUYOUT_ORDER_DAY_HTML.format(
                 date_from=month_ago.isoformat(),
                 date_to=today.isoformat(),
-                report_nav=REPORT_NAV_HTML,
+                report_nav=_report_nav_html(scope),
                 page_title="Выкупы по неделям",
                 granularity="week",
             ).encode("utf-8")
@@ -3712,7 +4076,7 @@ class Handler(BaseHTTPRequestHandler):
 
         elif parsed.path == "/analytics/funnel-upload":
             body = FUNNEL_UPLOAD_HTML.format(
-                report_nav=REPORT_NAV_HTML,
+                report_nav=_report_nav_html(scope),
             ).encode("utf-8")
             self._send_html(body)
 
@@ -3722,7 +4086,7 @@ class Handler(BaseHTTPRequestHandler):
           body = PRELIMINARY_ECONOMICS_HTML.format(
             date_from=week_ago.isoformat(),
             date_to=today.isoformat(),
-            report_nav=REPORT_NAV_HTML,
+            report_nav=_report_nav_html(scope),
           ).encode("utf-8")
           self._send_html(body)
 
@@ -3732,41 +4096,37 @@ class Handler(BaseHTTPRequestHandler):
           body = PRELIMINARY_ECONOMICS_SUMMARY_HTML.format(
             date_from=week_ago.isoformat(),
             date_to=today.isoformat(),
-            report_nav=REPORT_NAV_HTML,
+            report_nav=_report_nav_html(scope),
           ).encode("utf-8")
           self._send_html(body)
 
         elif parsed.path == "/api/analytics/period":
-            params = parse_qs(parsed.query)
             article = (params.get("article") or [""])[0]
             date_from = (params.get("date_from") or [""])[0]
             date_to = (params.get("date_to") or [""])[0]
             if not date_from or not date_to:
                 self._send_json({"error": "date_from and date_to are required", "rows": []}, status=400)
                 return
-            rows = _fetch_period_analytics(date_from, date_to, article)
+            rows = _fetch_period_analytics(date_from, date_to, article, scope=scope)
             self._send_json({"rows": rows})
 
         elif parsed.path == "/api/analytics/day":
-            params = parse_qs(parsed.query)
             date_from = (params.get("date_from") or [""])[0]
             date_to = (params.get("date_to") or [""])[0]
             if not date_from or not date_to:
                 self._send_json({"error": "date_from and date_to are required", "rows": [], "summary": {}}, status=400)
                 return
-            data = _fetch_day_analytics(date_from, date_to)
+            data = _fetch_day_analytics(date_from, date_to, scope=scope)
             self._send_json(data)
 
         elif parsed.path == "/api/analytics/article-day":
-            params = parse_qs(parsed.query)
             article = (params.get("article") or [""])[0]
             date_from = (params.get("date_from") or [""])[0] or None
             date_to = (params.get("date_to") or [""])[0] or None
-            rows = _fetch_article_day_analytics(article, date_from, date_to)
+            rows = _fetch_article_day_analytics(article, date_from, date_to, scope=scope)
             self._send_json({"rows": rows})
 
         elif parsed.path == "/api/analytics/buyout-order-day":
-            params = parse_qs(parsed.query)
             article = (params.get("article") or [""])[0]
             articles = params.get("articles") or []
             subject = (params.get("subject") or [""])[0]
@@ -3779,28 +4139,26 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json({"error": "date_from and date_to are required", "dates": [], "rows": []}, status=400)
                 return
             try:
-                payload = _fetch_buyout_order_day_pivot(date_from, date_to, article, articles=articles, subject=subject, granularity=granularity)
+                payload = _fetch_buyout_order_day_pivot(date_from, date_to, article, articles=articles, subject=subject, granularity=granularity, scope=scope)
             except ValueError:
                 self._send_json({"error": "invalid date format", "dates": [], "rows": []}, status=400)
                 return
             self._send_json(payload)
 
         elif parsed.path == "/api/analytics/buyout-subjects":
-            params = parse_qs(parsed.query)
             date_from = (params.get("date_from") or [""])[0]
             date_to = (params.get("date_to") or [""])[0]
             if not date_from or not date_to:
                 self._send_json({"error": "date_from and date_to are required", "subjects": []}, status=400)
                 return
             try:
-                subjects = _fetch_buyout_subjects(date_from, date_to)
+                subjects = _fetch_buyout_subjects(date_from, date_to, scope=scope)
             except ValueError:
                 self._send_json({"error": "invalid date format", "subjects": []}, status=400)
                 return
             self._send_json({"subjects": subjects})
 
         elif parsed.path == "/api/analytics/buyout-articles":
-            params = parse_qs(parsed.query)
             subject = (params.get("subject") or [""])[0]
             date_from = (params.get("date_from") or [""])[0]
             date_to = (params.get("date_to") or [""])[0]
@@ -3808,14 +4166,13 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json({"error": "date_from and date_to are required", "articles": []}, status=400)
                 return
             try:
-                articles = _fetch_buyout_articles(date_from, date_to, subject=subject)
+                articles = _fetch_buyout_articles(date_from, date_to, subject=subject, scope=scope)
             except ValueError:
                 self._send_json({"error": "invalid date format", "articles": []}, status=400)
                 return
             self._send_json({"articles": articles})
 
         elif parsed.path == "/api/analytics/preliminary-economics":
-          params = parse_qs(parsed.query)
           article = (params.get("article") or [""])[0]
           date_from = (params.get("date_from") or [""])[0]
           date_to = (params.get("date_to") or [""])[0]
@@ -3842,17 +4199,17 @@ class Handler(BaseHTTPRequestHandler):
             article,
             buyout_percent=buyout_percent,
             aggregate_by_period=aggregate,
+            scope=scope,
           )
           self._send_json(payload)
 
         elif parsed.path == "/db":
-            params = parse_qs(parsed.query)
             selected_table = (params.get("table") or [""])[0] or None
             try:
                 page = int((params.get("page") or ["1"])[0])
             except ValueError:
                 page = 1
-            body = _render_db_page(selected_table=selected_table, page=max(page, 1), page_size=200)
+            body = _render_db_page(selected_table=selected_table, page=max(page, 1), page_size=200, scope=scope)
             self._send_html(body)
 
         elif parsed.path == "/stream":
@@ -3861,6 +4218,9 @@ class Handler(BaseHTTPRequestHandler):
             date_to = (params.get("date_to") or [""])[0]
             skip_ads = (params.get("skip_ads") or ["0"])[0] == "1"
             skip_funnel = (params.get("skip_funnel") or ["0"])[0] == "1"
+            only = (params.get("mode") or params.get("only") or ["all"])[0]
+            if only not in {"all", "sales", "orders", "stocks", "ads", "funnel"}:
+                only = "all"
 
             if not date_from or not date_to:
                 self.send_response(400)
@@ -3876,7 +4236,7 @@ class Handler(BaseHTTPRequestHandler):
             log_q: queue.Queue = queue.Queue()
             thread = threading.Thread(
                 target=run_sync,
-                args=(date_from, date_to, skip_ads, skip_funnel, log_q),
+                args=(date_from, date_to, skip_ads, skip_funnel, log_q, only),
                 daemon=True,
             )
             thread.start()

@@ -9,13 +9,28 @@ from requests.exceptions import ConnectionError as RequestsConnectionError, HTTP
 from .utils import chunked, date_windows
 
 
+class _RateLimiter:
+    def __init__(self, interval_seconds: float) -> None:
+        self.interval_seconds = interval_seconds
+        self._last_call = 0.0
+
+    def wait(self) -> None:
+        now = time.monotonic()
+        delay = self.interval_seconds - (now - self._last_call)
+        if delay > 0:
+            time.sleep(delay)
+        self._last_call = time.monotonic()
+
+
 class WildberriesClient:
     FINANCE_BASE_URL = "https://finance-api.wildberries.ru"
     ADV_BASE_URL = "https://advert-api.wildberries.ru"
     STATS_BASE_URL = "https://statistics-api.wildberries.ru"
     ANALYTICS_BASE_URL = "https://seller-analytics-api.wildberries.ru"
-    ADV_SUCCESS_PAUSE_SECONDS = 1
-    FUNNEL_SUCCESS_PAUSE_SECONDS = 1
+    MINUTE_INTERVAL_SECONDS = 61.0
+    ADV_FAST_INTERVAL_SECONDS = 0.21
+    ADV_FULLSTATS_INTERVAL_SECONDS = 21.0
+    FUNNEL_INTERVAL_SECONDS = 21.0
 
     def __init__(self, finance_token: str, adv_token: str, timeout: int = 21) -> None:
         self._finance_session = requests.Session()
@@ -25,10 +40,36 @@ class WildberriesClient:
         self._stats_session = requests.Session()
         self._stats_session.headers.update({"Authorization": finance_token})
         self._timeout = timeout
+        self._finance_sales_limiter = _RateLimiter(self.MINUTE_INTERVAL_SECONDS)
+        self._stats_orders_limiter = _RateLimiter(self.MINUTE_INTERVAL_SECONDS)
+        self._stats_stocks_limiter = _RateLimiter(self.MINUTE_INTERVAL_SECONDS)
+        self._adv_fast_limiter = _RateLimiter(self.ADV_FAST_INTERVAL_SECONDS)
+        self._adv_fullstats_limiter = _RateLimiter(self.ADV_FULLSTATS_INTERVAL_SECONDS)
+        self._funnel_limiter = _RateLimiter(self.FUNNEL_INTERVAL_SECONDS)
 
-    def _adv_get(self, url: str, *, params: dict[str, str]) -> requests.Response:
+    def _retry_sleep_seconds(
+        self,
+        response: requests.Response,
+        *,
+        fallback_seconds: float,
+        attempt: int,
+    ) -> float:
+        retry_after = response.headers.get("Retry-After")
+        if retry_after and retry_after.isdigit():
+            return float(retry_after)
+        return max(fallback_seconds, min(15 * (attempt + 1), 180))
+
+    def _adv_get(
+        self,
+        url: str,
+        *,
+        params: dict[str, str],
+        limiter: _RateLimiter | None = None,
+    ) -> requests.Response:
         last_exc: Exception | None = None
         for attempt in range(5):
+            if limiter is not None:
+                limiter.wait()
             try:
                 response = self._adv_session.get(url, params=params, timeout=self._timeout)
             except (RequestsConnectionError, Timeout, SSLError) as exc:
@@ -39,32 +80,54 @@ class WildberriesClient:
             if response.status_code != 429:
                 response.raise_for_status()
                 return response
-            retry_after = response.headers.get("Retry-After")
-            sleep_seconds = int(retry_after) if retry_after and retry_after.isdigit() else min(5 * (attempt + 1), 30)
+            sleep_seconds = self._retry_sleep_seconds(
+                response,
+                fallback_seconds=limiter.interval_seconds if limiter is not None else 30,
+                attempt=attempt,
+            )
             time.sleep(sleep_seconds)
         if last_exc is not None:
             raise last_exc
         response.raise_for_status()
         return response
 
-    def _finance_post(self, url: str, *, payload: dict[str, Any]) -> requests.Response:
+    def _finance_post(
+        self,
+        url: str,
+        *,
+        payload: dict[str, Any],
+        limiter: _RateLimiter | None = None,
+    ) -> requests.Response:
         for attempt in range(5):
+            if limiter is not None:
+                limiter.wait()
             response = self._finance_session.post(url, json=payload, timeout=self._timeout)
             if response.status_code != 429:
                 if response.status_code != 204:
                     response.raise_for_status()
                 return response
-            retry_after = response.headers.get("Retry-After")
-            sleep_seconds = int(retry_after) if retry_after and retry_after.isdigit() else min(10 * (attempt + 1), 60)
+            sleep_seconds = self._retry_sleep_seconds(
+                response,
+                fallback_seconds=limiter.interval_seconds if limiter is not None else 60,
+                attempt=attempt,
+            )
             time.sleep(sleep_seconds)
         response.raise_for_status()
         return response
 
-    def _stats_get(self, url: str, *, params: dict[str, str]) -> requests.Response:
+    def _stats_get(
+        self,
+        url: str,
+        *,
+        params: dict[str, str],
+        limiter: _RateLimiter | None = None,
+    ) -> requests.Response:
         last_exc: Exception | None = None
         for attempt in range(5):
+            if limiter is not None:
+                limiter.wait()
             try:
-                response = self._stats_session.get(url, params=params, timeout=21)
+                response = self._stats_session.get(url, params=params, timeout=self._timeout)
             except (RequestsConnectionError, Timeout, SSLError) as exc:
                 last_exc = exc
                 sleep_seconds = min(15 * (attempt + 1), 60)
@@ -73,19 +136,30 @@ class WildberriesClient:
             if response.status_code != 429:
                 response.raise_for_status()
                 return response
-            retry_after = response.headers.get("Retry-After")
-            sleep_seconds = int(retry_after) if retry_after and retry_after.isdigit() else min(5 * (attempt + 1), 30)
+            sleep_seconds = self._retry_sleep_seconds(
+                response,
+                fallback_seconds=limiter.interval_seconds if limiter is not None else 60,
+                attempt=attempt,
+            )
             time.sleep(sleep_seconds)
         if last_exc is not None:
             raise last_exc
         response.raise_for_status()
         return response
 
-    def _stats_post(self, url: str, *, payload: dict[str, Any]) -> requests.Response:
+    def _stats_post(
+        self,
+        url: str,
+        *,
+        payload: dict[str, Any],
+        limiter: _RateLimiter | None = None,
+    ) -> requests.Response:
         last_exc: Exception | None = None
         for attempt in range(5):
+            if limiter is not None:
+                limiter.wait()
             try:
-                response = self._stats_session.post(url, json=payload, timeout=21)
+                response = self._stats_session.post(url, json=payload, timeout=self._timeout)
             except (RequestsConnectionError, Timeout, SSLError) as exc:
                 last_exc = exc
                 sleep_seconds = min(15 * (attempt + 1), 60)
@@ -94,8 +168,11 @@ class WildberriesClient:
             if response.status_code != 429:
                 response.raise_for_status()
                 return response
-            retry_after = response.headers.get("Retry-After")
-            sleep_seconds = int(retry_after) if retry_after and retry_after.isdigit() else min(5 * (attempt + 1), 30)
+            sleep_seconds = self._retry_sleep_seconds(
+                response,
+                fallback_seconds=limiter.interval_seconds if limiter is not None else 60,
+                attempt=attempt,
+            )
             time.sleep(sleep_seconds)
         if last_exc is not None:
             raise last_exc
@@ -114,7 +191,7 @@ class WildberriesClient:
                 "rrdId": rrd_id,
                 "period": period,
             }
-            response = self._finance_post(url, payload=payload)
+            response = self._finance_post(url, payload=payload, limiter=self._finance_sales_limiter)
             if response.status_code == 204:
                 return all_rows
             rows = response.json()
@@ -128,7 +205,7 @@ class WildberriesClient:
     def fetch_orders(self, date_from: str) -> list[dict[str, Any]]:
         """Fetch supplier orders stream (near real-time) from statistics API."""
         url = f"{self.STATS_BASE_URL}/api/v1/supplier/orders"
-        response = self._stats_get(url, params={"dateFrom": date_from})
+        response = self._stats_get(url, params={"dateFrom": date_from}, limiter=self._stats_orders_limiter)
         payload = response.json()
         if isinstance(payload, list):
             return payload
@@ -142,7 +219,7 @@ class WildberriesClient:
         seen_cursors: set[str] = set()
 
         while True:
-            response = self._stats_get(url, params={"dateFrom": current_date_from})
+            response = self._stats_get(url, params={"dateFrom": current_date_from}, limiter=self._stats_stocks_limiter)
             payload = response.json()
             if not isinstance(payload, list) or not payload:
                 return all_rows
@@ -156,7 +233,6 @@ class WildberriesClient:
                 return all_rows
             seen_cursors.add(next_cursor)
             current_date_from = next_cursor
-            time.sleep(61)
 
     def fetch_funnel_history(self, date_from: str, date_to: str, nm_ids: list[int] | None = None) -> list[dict[str, Any]]:
         """Fetch sales funnel metrics (shows, clicks, cart, orders, buyouts)."""
@@ -183,8 +259,7 @@ class WildberriesClient:
                 "skipDeletedNm": False,
                 "aggregationLevel": "day",
             }
-            response = self._stats_session.post(url, json=payload, timeout=self._timeout)
-            response.raise_for_status()
+            response = self._stats_post(url, payload=payload, limiter=self._funnel_limiter)
             data = response.json()
             if isinstance(data, list):
                 return data
@@ -210,7 +285,6 @@ class WildberriesClient:
                 retry_single_ids = False
                 try:
                     all_rows.extend(_request(window_start, window_end, nm_chunk))
-                    time.sleep(self.FUNNEL_SUCCESS_PAUSE_SECONDS)
                     continue
                 except (RequestsConnectionError, Timeout, SSLError):
                     continue
@@ -222,7 +296,6 @@ class WildberriesClient:
                                 continue
                             try:
                                 all_rows.extend(_request(day_start, day_end, nm_chunk))
-                                time.sleep(self.FUNNEL_SUCCESS_PAUSE_SECONDS)
                             except HTTPError as day_exc:
                                 day_status = _http_status(day_exc)
                                 if _is_unavailable_period(day_exc):
@@ -252,7 +325,6 @@ class WildberriesClient:
                 for nm_id in nm_chunk:
                     try:
                         all_rows.extend(_request(window_start, window_end, [nm_id]))
-                        time.sleep(self.FUNNEL_SUCCESS_PAUSE_SECONDS)
                     except HTTPError as exc2:
                         status2 = _http_status(exc2)
                         if _is_unavailable_period(exc2):
@@ -270,7 +342,7 @@ class WildberriesClient:
 
     def fetch_campaign_ids(self) -> list[int]:
         url = f"{self.ADV_BASE_URL}/adv/v1/promotion/count"
-        response = self._adv_get(url, params={})
+        response = self._adv_get(url, params={}, limiter=self._adv_fast_limiter)
         data = response.json()
         adverts = data.get("adverts", [])
         result: list[int] = []
@@ -293,10 +365,10 @@ class WildberriesClient:
             response = self._adv_get(
                 url,
                 params={"ids": ",".join(str(value) for value in chunk)},
+                limiter=self._adv_fast_limiter,
             )
             payload = response.json()
             all_rows.extend(payload.get("adverts", []))
-            time.sleep(0.3)
         return all_rows
 
     def fetch_relevant_campaign_ids(self, nm_ids: list[int]) -> list[int]:
@@ -333,9 +405,9 @@ class WildberriesClient:
                         "beginDate": window_start,
                         "endDate": window_end,
                     },
+                    limiter=self._adv_fullstats_limiter,
                 )
                 payload = response.json()
                 if isinstance(payload, list):
                     all_rows.extend(payload)
-                time.sleep(self.ADV_SUCCESS_PAUSE_SECONDS)
         return all_rows

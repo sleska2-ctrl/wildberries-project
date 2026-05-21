@@ -188,6 +188,27 @@ def extract_filter_values(
     return values
 
 
+def extract_our_nm_ids(sheet_values: list[list[str]]) -> set[str]:
+    if not sheet_values:
+        return set()
+
+    header = {name.strip(): index for index, name in enumerate(sheet_values[0])}
+    nm_idx = _first_existing_header(header, ("Артикул WB", "nmId", "nm_id"))
+    our_idx = header.get("ИИТех")
+    if nm_idx is None or our_idx is None:
+        return set()
+
+    result: set[str] = set()
+    for row in sheet_values[1:]:
+        if len(row) <= max(nm_idx, our_idx):
+            continue
+        nm_id = row[nm_idx].strip()
+        marker = row[our_idx].strip()
+        if nm_id and marker:
+            result.add(nm_id)
+    return result
+
+
 def flatten_ads_rows(stats_payload: list[dict[str, Any]]) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for campaign in stats_payload:
@@ -433,7 +454,8 @@ def build_buyout_order_day_rows(
         "Сумма продаж до возвратов",
         "Возвраты, шт",
         "Сумма возвратов",
-        "% выкупа",
+        "% выкупа WB",
+        "% выкупа от заказов",
         "Последняя дата события",
     ]
     grouped: dict[tuple[str, str], dict[str, Any]] = defaultdict(
@@ -450,6 +472,7 @@ def build_buyout_order_day_rows(
             "event_return_count": Decimal("0"),
             "ordered_sale_count": Decimal("0"),
             "ordered_return_count": Decimal("0"),
+            "raw_order_count": Decimal("0"),
             "last_event_date": "",
         }
     )
@@ -469,6 +492,7 @@ def build_buyout_order_day_rows(
         bucket = grouped[(order_date, nm_id)]
         if article and not bucket["article"]:
             bucket["article"] = article
+        bucket["raw_order_count"] += Decimal("1")
 
     for row in sales_rows:
         doc_type = str(row.get("docTypeName", "")).strip()
@@ -525,9 +549,9 @@ def build_buyout_order_day_rows(
             bucket["article"] = article
         bucket["ad_spend"] += as_decimal(row.get("sum"))
 
-    # Build funnel index: (date, nmId) -> (order_sum, order_count, buyout_count)
-    # These three fields are more accurate in funnel than in raw_orders/raw_sales.
-    funnel_index: dict[tuple[str, str], tuple[Decimal, Decimal, Decimal]] = {}
+    # Build funnel index: (date, nmId) -> (order_sum, order_count, buyout_count, cancel_count)
+    # These fields are more accurate in funnel than in raw_orders/raw_sales.
+    funnel_index: dict[tuple[str, str], tuple[Decimal, Decimal, Decimal, Decimal]] = {}
     for item in (funnel_data or []):
         product = item.get("product", {}) or {}
         nm_id_f = str(product.get("nmId", "")).strip()
@@ -543,7 +567,8 @@ def build_buyout_order_day_rows(
             order_sum_f = as_decimal(history_item.get("orderSum"))
             order_count_f = as_decimal(history_item.get("orderCount"))
             buyout_count_f = as_decimal(history_item.get("buyoutCount"))
-            funnel_index[(date_f, nm_id_f)] = (order_sum_f, order_count_f, buyout_count_f)
+            cancel_count_f = as_decimal(history_item.get("cancelCount"))
+            funnel_index[(date_f, nm_id_f)] = (order_sum_f, order_count_f, buyout_count_f, cancel_count_f)
             # Ensure bucket exists so funnel-only entries appear in the output
             bucket_f = grouped[(date_f, nm_id_f)]
             if vendor_code and not bucket_f["article"]:
@@ -558,14 +583,19 @@ def build_buyout_order_day_rows(
 
         funnel_entry = funnel_index.get((order_date, nm_id))
         if funnel_entry is not None:
-            orders_sum_val, orders_count_val, ordered_buyout_count_val = funnel_entry
+            orders_sum_val, orders_count_val, ordered_buyout_count_val, cancel_count_val = funnel_entry
+            if orders_sum_val > 0 and orders_count_val == 0:
+                orders_count_val = bucket["raw_order_count"]
         else:
             # Заказы для этого отчета берем только из funnel_analytics.
             orders_sum_val = Decimal("0")
             orders_count_val = Decimal("0")
             ordered_buyout_count_val = bucket["ordered_sale_count"] - bucket["ordered_return_count"]
+            cancel_count_val = Decimal("0")
 
-        buyout_percent = (ordered_buyout_count_val / orders_count_val * Decimal("100")) if orders_count_val else Decimal("0")
+        resolved = ordered_buyout_count_val + cancel_count_val
+        buyout_percent_wb = (ordered_buyout_count_val / resolved * Decimal("100")) if resolved else Decimal("0")
+        buyout_percent_orders = (ordered_buyout_count_val / orders_count_val * Decimal("100")) if orders_count_val else Decimal("0")
         result.append(
             [
                 order_date,
@@ -584,7 +614,8 @@ def build_buyout_order_day_rows(
                 money(bucket["ordered_sale_sum"]),
                 bucket["ordered_return_count"],
                 money(bucket["ordered_return_sum"]),
-                pct(buyout_percent),
+                pct(buyout_percent_wb),
+                pct(buyout_percent_orders),
                 bucket["last_event_date"],
             ]
         )
