@@ -23,7 +23,7 @@ from urllib.parse import parse_qs, quote_plus, urlparse
 ROOT = Path(__file__).parent
 PYTHON = sys.executable
 DB_PATH = os.getenv("SQLITE_DB_PATH", str(ROOT / "data" / "wb_sync.db")).strip() or str(ROOT / "data" / "wb_sync.db")
-SITE_PASSWORD = os.getenv("WB_SITE_PASSWORD", "321")
+SITE_PASSWORD = os.getenv("WB_SITE_PASSWORD", "").strip()
 EXTERNAL_SKU_XLSX_PATH = ROOT / "data" / "sku_iitech.xlsx"
 SYNC_LOG_DIR = ROOT / "data" / "sync_logs"
 LATEST_SYNC_LOG_PATH = SYNC_LOG_DIR / "latest.log"
