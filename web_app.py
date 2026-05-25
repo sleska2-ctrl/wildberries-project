@@ -559,15 +559,47 @@ def _aggregate_nested_daily_values_by_week(
   return result
 
 
-def _buyout_subject_join() -> str:
+def _buyout_subject_join(conn: sqlite3.Connection) -> str:
+  columns = _table_columns(conn, "sku")
+  nmid_col = _first_existing(columns, ["Артикул WB", "nmId", "nm_id"])
+  subject_expr = _sql_ident("Предмет") if "Предмет" in columns else "''"
+  strategy_expr = _sql_ident("Стратегия") if "Стратегия" in columns else "''"
+  revenue_category_expr = _sql_ident("Категория по выручке") if "Категория по выручке" in columns else "''"
+  if not nmid_col:
+    return "LEFT JOIN (SELECT NULL AS nmid, '' AS subject, '' AS strategy, '' AS revenue_category WHERE 0) sku_subject ON 1 = 0"
   return (
     "LEFT JOIN ("
     "SELECT "
-    "\"Артикул WB\" AS nmid, "
-    "MIN(\"Предмет\") AS subject "
-    "FROM sku WHERE TRIM(COALESCE(\"Артикул WB\", '')) != '' GROUP BY \"Артикул WB\""
+    f"{_sql_ident(nmid_col)} AS nmid, "
+    f"MIN({subject_expr}) AS subject, "
+    f"MIN({strategy_expr}) AS strategy, "
+    f"MIN({revenue_category_expr}) AS revenue_category "
+    "FROM sku "
+    f"WHERE TRIM(COALESCE({_sql_ident(nmid_col)}, '')) != '' GROUP BY {_sql_ident(nmid_col)}"
     ") sku_subject ON sku_subject.nmid = buyout_order_day.\"nmId\""
   )
+
+
+def _append_sku_attribute_filter(
+  where: list[str],
+  params: list[str],
+  nmid_expr: str,
+  *,
+  subject: str = "",
+  strategy: str = "",
+  revenue_category: str = "",
+) -> None:
+  filters: list[str] = ["TRIM(COALESCE(\"Артикул WB\", '')) != ''"]
+  for column, value in (
+    ("Предмет", subject.strip()),
+    ("Стратегия", strategy.strip()),
+    ("Категория по выручке", revenue_category.strip()),
+  ):
+    if value:
+      filters.append(f"{_sql_ident(column)} = ?")
+      params.append(value)
+  if len(filters) > 1:
+    where.append(f"{nmid_expr} IN (SELECT TRIM(\"Артикул WB\") FROM SKU WHERE {' AND '.join(filters)})")
 
 
 def _buyout_cogs_join(conn: sqlite3.Connection) -> str:
@@ -617,7 +649,7 @@ def _buyout_nm_join(conn: sqlite3.Connection) -> str:
   return "LEFT JOIN (SELECT NULL AS article, NULL AS nmid WHERE 0) nm_data ON 1 = 0"
 
 
-def _fetch_buyout_subjects(date_from: str, date_to: str, scope: str = DEFAULT_SCOPE) -> list[str]:
+def _fetch_buyout_filter_options(date_from: str, date_to: str, scope: str = DEFAULT_SCOPE) -> dict[str, list[str]]:
   dates, effective_from, effective_to = _date_range_limited(date_from, date_to, max_days=30)
   with _db_connect() as conn:
     ctx = _scope_context(conn)
@@ -631,30 +663,60 @@ def _fetch_buyout_subjects(date_from: str, date_to: str, scope: str = DEFAULT_SC
       scope_params.extend(our_nm_ids)
     rows = conn.execute(
       (
-        "SELECT sku_subject.subject AS subject, SUM(CAST(buyout_order_day.\"Сумма заказов\" AS REAL)) AS orders_sum "
+        "SELECT sku_subject.subject AS subject, sku_subject.strategy AS strategy, "
+        "sku_subject.revenue_category AS revenue_category, "
+        "SUM(CAST(buyout_order_day.\"Сумма заказов\" AS REAL)) AS orders_sum "
         "FROM buyout_order_day "
-        f"{_buyout_subject_join()} "
+        f"{_buyout_subject_join(conn)} "
         "WHERE buyout_order_day.\"Дата\" >= ? AND buyout_order_day.\"Дата\" <= ? "
         f"{scope_where} "
-        "AND TRIM(COALESCE(sku_subject.subject, '')) != '' "
-        "GROUP BY sku_subject.subject "
-        "ORDER BY orders_sum DESC, sku_subject.subject ASC "
-        "LIMIT 1000"
+        "AND (TRIM(COALESCE(sku_subject.subject, '')) != '' "
+        "OR TRIM(COALESCE(sku_subject.strategy, '')) != '' "
+        "OR TRIM(COALESCE(sku_subject.revenue_category, '')) != '') "
+        "GROUP BY sku_subject.subject, sku_subject.strategy, sku_subject.revenue_category "
+        "ORDER BY orders_sum DESC "
       ),
       [effective_from, effective_to, *scope_params],
     ).fetchall()
-  return [str(row["subject"]) for row in rows if str(row["subject"]).strip()]
+  result: dict[str, set[str]] = {"subjects": set(), "strategies": set(), "revenue_categories": set()}
+  for row in rows:
+    if str(row["subject"] or "").strip():
+      result["subjects"].add(str(row["subject"]).strip())
+    if str(row["strategy"] or "").strip():
+      result["strategies"].add(str(row["strategy"]).strip())
+    if str(row["revenue_category"] or "").strip():
+      result["revenue_categories"].add(str(row["revenue_category"]).strip())
+  return {key: sorted(values, key=lambda value: value.lower()) for key, values in result.items()}
 
 
-def _fetch_buyout_articles(date_from: str, date_to: str, subject: str = "", scope: str = DEFAULT_SCOPE) -> list[dict[str, object]]:
+def _fetch_buyout_subjects(date_from: str, date_to: str, scope: str = DEFAULT_SCOPE) -> list[str]:
+  return _fetch_buyout_filter_options(date_from, date_to, scope=scope)["subjects"]
+
+
+def _fetch_buyout_articles(
+  date_from: str,
+  date_to: str,
+  subject: str = "",
+  strategy: str = "",
+  revenue_category: str = "",
+  scope: str = DEFAULT_SCOPE,
+) -> list[dict[str, object]]:
   dates, effective_from, effective_to = _date_range_limited(date_from, date_to, max_days=30)
   day_count = max(1, len(dates))
   where = ['buyout_order_day."Дата" >= ?', 'buyout_order_day."Дата" <= ?']
   params: list[str] = [effective_from, effective_to]
   subject = subject.strip()
+  strategy = strategy.strip()
+  revenue_category = revenue_category.strip()
   if subject:
     where.append("sku_subject.subject = ?")
     params.append(subject)
+  if strategy:
+    where.append("sku_subject.strategy = ?")
+    params.append(strategy)
+  if revenue_category:
+    where.append("sku_subject.revenue_category = ?")
+    params.append(revenue_category)
   with _db_connect() as conn:
     ctx = _scope_context(conn)
     our_nm_ids = sorted(ctx.get("our_nm_ids", set()))
@@ -675,7 +737,7 @@ def _fetch_buyout_articles(date_from: str, date_to: str, subject: str = "", scop
         "COALESCE(fa.total_buyout, 0) AS fa_buyout, "
         "COALESCE(fa.total_cancel, 0) AS fa_cancel "
         "FROM buyout_order_day "
-        f"{_buyout_subject_join()} "
+        f"{_buyout_subject_join(conn)} "
         f"{_stocks_join(conn)} "
         "LEFT JOIN ("
         "  SELECT nmId, SUM(CAST(buyoutCount AS REAL)) AS total_buyout, SUM(CAST(cancelCount AS REAL)) AS total_cancel"
@@ -713,6 +775,8 @@ def _fetch_buyout_order_day_pivot(
   article_query: str = "",
   articles: list[str] | None = None,
   subject: str = "",
+  strategy: str = "",
+  revenue_category: str = "",
   granularity: str = "day",
   scope: str = DEFAULT_SCOPE,
 ) -> dict[str, object]:
@@ -722,8 +786,10 @@ def _fetch_buyout_order_day_pivot(
   params: list[str] = [effective_from, effective_to]
   article_query = article_query.strip()
   subject = subject.strip()
+  strategy = strategy.strip()
+  revenue_category = revenue_category.strip()
   selected_articles = [article.strip() for article in (articles or []) if article.strip()]
-  has_article_filter = bool(selected_articles or article_query or subject)
+  has_article_filter = bool(selected_articles or article_query or subject or strategy or revenue_category)
   if selected_articles:
     placeholders = ", ".join("?" for _ in selected_articles)
     where.append(f'buyout_order_day."nmId" IN ({placeholders})')
@@ -735,9 +801,15 @@ def _fetch_buyout_order_day_pivot(
     else:
       where.append('buyout_order_day."Артикул" = ?')
       params.append(article_query)
-  elif subject:
+  if subject:
     where.append("sku_subject.subject = ?")
     params.append(subject)
+  if strategy:
+    where.append("sku_subject.strategy = ?")
+    params.append(strategy)
+  if revenue_category:
+    where.append("sku_subject.revenue_category = ?")
+    params.append(revenue_category)
 
   with _db_connect() as conn:
     ctx = _scope_context(conn)
@@ -783,20 +855,20 @@ def _fetch_buyout_order_day_pivot(
         else:
           raw_where.append("raw_sales.vendorCode = ?")
           raw_params.append(article_query)
-      elif subject:
-        raw_where.append(
-          "raw_sales.nmId IN ("
-          "SELECT TRIM(\"Артикул WB\") FROM SKU "
-          "WHERE TRIM(COALESCE(\"Артикул WB\", '')) != '' AND \"Предмет\" = ?"
-          ")"
-        )
-        raw_params.append(subject)
       else:
         raw_where.append(
           "raw_sales.nmId IN ("
           "SELECT TRIM(\"Артикул WB\") FROM SKU WHERE TRIM(COALESCE(\"Артикул WB\", '')) != ''"
           ")"
         )
+      _append_sku_attribute_filter(
+        raw_where,
+        raw_params,
+        "raw_sales.nmId",
+        subject=subject,
+        strategy=strategy,
+        revenue_category=revenue_category,
+      )
       spp_rows = conn.execute(
         (
           "SELECT "
@@ -838,20 +910,20 @@ def _fetch_buyout_order_day_pivot(
       else:
         funnel_where.append("supplierArticle = ?")
         funnel_params.append(article_query)
-    elif subject:
-      funnel_where.append(
-        "nmId IN ("
-        "SELECT TRIM(\"Артикул WB\") FROM SKU "
-        "WHERE TRIM(COALESCE(\"Артикул WB\", '')) != '' AND \"Предмет\" = ?"
-        ")"
-      )
-      funnel_params.append(subject)
     else:
       funnel_where.append(
         "nmId IN ("
         "SELECT TRIM(\"Артикул WB\") FROM SKU WHERE TRIM(COALESCE(\"Артикул WB\", '')) != ''"
         ")"
       )
+    _append_sku_attribute_filter(
+      funnel_where,
+      funnel_params,
+      "nmId",
+      subject=subject,
+      strategy=strategy,
+      revenue_category=revenue_category,
+    )
 
     funnel_rows = conn.execute(
       (
@@ -958,7 +1030,7 @@ def _fetch_buyout_order_day_pivot(
         "SUM(CAST(buyout_order_day.\"Возвраты, шт\" AS REAL)) AS return_qty, "
         "SUM(CAST(buyout_order_day.\"Сумма возвратов\" AS REAL)) AS return_sum "
         "FROM buyout_order_day "
-        f"{_buyout_subject_join()} "
+        f"{_buyout_subject_join(conn)} "
         f"{cogs_join} "
         f"{where_sql} GROUP BY buyout_order_day.\"Дата\" ORDER BY buyout_order_day.\"Дата\" ASC"
       ),
@@ -2080,6 +2152,18 @@ BUYOUT_ORDER_DAY_HTML = """\
               <option value="">Все предметы</option>
             </select>
           </div>
+          <div class="subject-filter">
+            <label for="strategy">Стратегия</label>
+            <select id="strategy">
+              <option value="">Все стратегии</option>
+            </select>
+          </div>
+          <div class="subject-filter">
+            <label for="revenue-category">Категория по выручке</label>
+            <select id="revenue-category">
+              <option value="">Все категории</option>
+            </select>
+          </div>
           <div class="article-list" id="article-list"></div>
         </div>
         <div class="articles-mini">
@@ -2107,6 +2191,8 @@ const meta = document.getElementById('meta');
 const tbl = document.getElementById('tbl');
 const articleList = document.getElementById('article-list');
 const subjectEl = document.getElementById('subject');
+const strategyEl = document.getElementById('strategy');
+const revenueCategoryEl = document.getElementById('revenue-category');
 const chartLegend = document.getElementById('chart-legend');
 const chartWrap = document.getElementById('chart-wrap');
 const workspaceEl = document.getElementById('workspace');
@@ -2145,6 +2231,8 @@ function restoreFilters() {{
     if (saved.df) document.getElementById('df').value = saved.df;
     if (saved.dt) document.getElementById('dt').value = saved.dt;
     if (saved.subject !== undefined) subjectEl.dataset.pendingValue = saved.subject;
+    if (saved.strategy !== undefined) strategyEl.dataset.pendingValue = saved.strategy;
+    if (saved.revenueCategory !== undefined) revenueCategoryEl.dataset.pendingValue = saved.revenueCategory;
     if (Array.isArray(saved.selectedArticles)) selectedArticles = new Set(saved.selectedArticles.map(String).filter(value => /^\d+$/.test(value)));
     if (Array.isArray(saved.chartMetrics)) {{
       activeChartMetrics = new Set(saved.chartMetrics);
@@ -2162,6 +2250,8 @@ function saveFilters() {{
     df: document.getElementById('df').value,
     dt: document.getElementById('dt').value,
     subject: subjectEl.value,
+    strategy: strategyEl.value,
+    revenueCategory: revenueCategoryEl.value,
     selectedArticles: [...selectedArticles],
     chartMetrics: [...activeChartMetrics],
     collapsedGroups: [...collapsedGroups],
@@ -2185,6 +2275,15 @@ function applyQuickRange(days) {{
 function scheduleLoad() {{
   clearTimeout(filterTimer);
   filterTimer = setTimeout(loadData, 350);
+}}
+
+function resetArticleFilters() {{
+  subjectEl.value = '';
+  strategyEl.value = '';
+  revenueCategoryEl.value = '';
+  delete subjectEl.dataset.pendingValue;
+  delete strategyEl.dataset.pendingValue;
+  delete revenueCategoryEl.dataset.pendingValue;
 }}
 
 function escapeHtml(value) {{
@@ -2703,16 +2802,32 @@ async function loadSubjects() {{
   const key = `${{df}}..${{dt}}..${{scope}}`;
   if (key === subjectsLoadedFor) return;
   subjectsLoadedFor = key;
-  const current = subjectEl.dataset.pendingValue !== undefined ? subjectEl.dataset.pendingValue : subjectEl.value;
+  const currentSubject = subjectEl.dataset.pendingValue !== undefined ? subjectEl.dataset.pendingValue : subjectEl.value;
+  const currentStrategy = strategyEl.dataset.pendingValue !== undefined ? strategyEl.dataset.pendingValue : strategyEl.value;
+  const currentRevenueCategory = revenueCategoryEl.dataset.pendingValue !== undefined ? revenueCategoryEl.dataset.pendingValue : revenueCategoryEl.value;
   delete subjectEl.dataset.pendingValue;
+  delete strategyEl.dataset.pendingValue;
+  delete revenueCategoryEl.dataset.pendingValue;
   const qs = new URLSearchParams({{ date_from: df, date_to: dt, scope }});
-  const res = await fetch(`/api/analytics/buyout-subjects?${{qs.toString()}}`);
+  const res = await fetch(`/api/analytics/buyout-filter-options?${{qs.toString()}}`);
   const data = await res.json();
   const subjects = data.subjects || [];
+  const strategies = data.strategies || [];
+  const revenueCategories = data.revenue_categories || [];
   subjectEl.innerHTML = '<option value="">Все предметы</option>' + subjects.map(subject => {{
-    const selected = subject === current ? ' selected' : '';
+    const selected = subject === currentSubject ? ' selected' : '';
     const safeSubject = escapeHtml(subject);
     return `<option value="${{safeSubject}}"${{selected}}>${{safeSubject}}</option>`;
+  }}).join('');
+  strategyEl.innerHTML = '<option value="">Все стратегии</option>' + strategies.map(strategy => {{
+    const selected = strategy === currentStrategy ? ' selected' : '';
+    const safeStrategy = escapeHtml(strategy);
+    return `<option value="${{safeStrategy}}"${{selected}}>${{safeStrategy}}</option>`;
+  }}).join('');
+  revenueCategoryEl.innerHTML = '<option value="">Все категории</option>' + revenueCategories.map(category => {{
+    const selected = category === currentRevenueCategory ? ' selected' : '';
+    const safeCategory = escapeHtml(category);
+    return `<option value="${{safeCategory}}"${{selected}}>${{safeCategory}}</option>`;
   }}).join('');
 }}
 
@@ -2722,10 +2837,12 @@ async function loadArticles() {{
   const scope = window.getGlobalScope ? window.getGlobalScope() : 'ours';
   await loadSubjects();
   const subject = subjectEl.value;
-  const key = `${{df}}..${{dt}}..${{subject}}..${{scope}}`;
+  const strategy = strategyEl.value;
+  const revenueCategory = revenueCategoryEl.value;
+  const key = `${{df}}..${{dt}}..${{subject}}..${{strategy}}..${{revenueCategory}}..${{scope}}`;
   if (key === articlesLoadedFor) return;
   articlesLoadedFor = key;
-  const qs = new URLSearchParams({{ date_from: df, date_to: dt, subject, scope }});
+  const qs = new URLSearchParams({{ date_from: df, date_to: dt, subject, strategy, revenue_category: revenueCategory, scope }});
   const res = await fetch(`/api/analytics/buyout-articles?${{qs.toString()}}`);
   const data = await res.json();
   const articles = data.articles || [];
@@ -2743,9 +2860,11 @@ async function loadData() {{
   const df = document.getElementById('df').value;
   const dt = document.getElementById('dt').value;
   const subject = subjectEl.value;
+  const strategy = strategyEl.value;
+  const revenueCategory = revenueCategoryEl.value;
   meta.textContent = 'Загружаю...';
   await loadArticles();
-  const qs = new URLSearchParams({{ article, date_from: df, date_to: dt, subject, granularity: reportGranularity, scope: window.getGlobalScope ? window.getGlobalScope() : 'ours' }});
+  const qs = new URLSearchParams({{ article, date_from: df, date_to: dt, subject, strategy, revenue_category: revenueCategory, granularity: reportGranularity, scope: window.getGlobalScope ? window.getGlobalScope() : 'ours' }});
   for (const articleName of selectedArticles) qs.append('articles', articleName);
   const res = await fetch(`/api/analytics/buyout-order-day?${{qs.toString()}}`);
   const data = await res.json();
@@ -2767,19 +2886,33 @@ subjectEl.addEventListener('change', () => {{
   saveFilters();
   loadData();
 }});
+strategyEl.addEventListener('change', () => {{
+  selectedArticles.clear();
+  articlesLoadedFor = '';
+  saveFilters();
+  loadData();
+}});
+revenueCategoryEl.addEventListener('change', () => {{
+  selectedArticles.clear();
+  articlesLoadedFor = '';
+  saveFilters();
+  loadData();
+}});
 document.getElementById('df').addEventListener('change', () => {{ subjectsLoadedFor = ''; articlesLoadedFor = ''; loadData(); }});
 document.getElementById('dt').addEventListener('change', () => {{ subjectsLoadedFor = ''; articlesLoadedFor = ''; loadData(); }});
 document.getElementById('select-all').addEventListener('click', async () => {{
   selectedArticles.clear();
-  saveFilters();
+  resetArticleFilters();
   articlesLoadedFor = '';
+  saveFilters();
   await loadArticles();
   loadData();
 }});
 document.getElementById('clear-all').addEventListener('click', () => {{
   selectedArticles.clear();
-  saveFilters();
+  resetArticleFilters();
   articlesLoadedFor = '';
+  saveFilters();
   loadArticles();
   loadData();
 }});
@@ -4130,6 +4263,8 @@ class Handler(BaseHTTPRequestHandler):
             article = (params.get("article") or [""])[0]
             articles = params.get("articles") or []
             subject = (params.get("subject") or [""])[0]
+            strategy = (params.get("strategy") or [""])[0]
+            revenue_category = (params.get("revenue_category") or [""])[0]
             date_from = (params.get("date_from") or [""])[0]
             date_to = (params.get("date_to") or [""])[0]
             granularity = (params.get("granularity") or ["day"])[0]
@@ -4139,11 +4274,34 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json({"error": "date_from and date_to are required", "dates": [], "rows": []}, status=400)
                 return
             try:
-                payload = _fetch_buyout_order_day_pivot(date_from, date_to, article, articles=articles, subject=subject, granularity=granularity, scope=scope)
+                payload = _fetch_buyout_order_day_pivot(
+                    date_from,
+                    date_to,
+                    article,
+                    articles=articles,
+                    subject=subject,
+                    strategy=strategy,
+                    revenue_category=revenue_category,
+                    granularity=granularity,
+                    scope=scope,
+                )
             except ValueError:
                 self._send_json({"error": "invalid date format", "dates": [], "rows": []}, status=400)
                 return
             self._send_json(payload)
+
+        elif parsed.path == "/api/analytics/buyout-filter-options":
+            date_from = (params.get("date_from") or [""])[0]
+            date_to = (params.get("date_to") or [""])[0]
+            if not date_from or not date_to:
+                self._send_json({"error": "date_from and date_to are required", "subjects": [], "strategies": [], "revenue_categories": []}, status=400)
+                return
+            try:
+                options = _fetch_buyout_filter_options(date_from, date_to, scope=scope)
+            except ValueError:
+                self._send_json({"error": "invalid date format", "subjects": [], "strategies": [], "revenue_categories": []}, status=400)
+                return
+            self._send_json(options)
 
         elif parsed.path == "/api/analytics/buyout-subjects":
             date_from = (params.get("date_from") or [""])[0]
@@ -4160,13 +4318,22 @@ class Handler(BaseHTTPRequestHandler):
 
         elif parsed.path == "/api/analytics/buyout-articles":
             subject = (params.get("subject") or [""])[0]
+            strategy = (params.get("strategy") or [""])[0]
+            revenue_category = (params.get("revenue_category") or [""])[0]
             date_from = (params.get("date_from") or [""])[0]
             date_to = (params.get("date_to") or [""])[0]
             if not date_from or not date_to:
                 self._send_json({"error": "date_from and date_to are required", "articles": []}, status=400)
                 return
             try:
-                articles = _fetch_buyout_articles(date_from, date_to, subject=subject, scope=scope)
+                articles = _fetch_buyout_articles(
+                    date_from,
+                    date_to,
+                    subject=subject,
+                    strategy=strategy,
+                    revenue_category=revenue_category,
+                    scope=scope,
+                )
             except ValueError:
                 self._send_json({"error": "invalid date format", "articles": []}, status=400)
                 return
