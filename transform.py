@@ -19,7 +19,7 @@ def _article_column_idx(header: dict[str, int], article_filter_type: str) -> int
     if article_filter_type == "vendorCode":
         return _first_existing_header(
             header,
-            ("vendorCode", "Артикул поставщика", "supplierArticle", "НАШ", "SKU", "sku"),
+            ("vendorCode", "Артикул поставщика", "supplierArticle", "SKU", "sku"),
         )
     if article_filter_type == "nmId":
         return _first_existing_header(header, ("nmId", "nm_id", "Артикул WB"))
@@ -88,7 +88,7 @@ def extract_orders_filters(sheet_values: list[list[str]]) -> tuple[set[str], set
         return set(), set()
 
     header = {name.strip(): index for index, name in enumerate(sheet_values[0])}
-    supplier_idx = header.get("Артикул поставщика", header.get("НАШ"))
+    supplier_idx = header.get("Артикул поставщика")
     nm_idx = header.get("Артикул WB", header.get("nmId"))
 
     supplier_articles: set[str] = set()

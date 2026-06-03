@@ -8,10 +8,18 @@ services:
     env_file:
       - .env
     environment:
+      TZ: "Europe/Moscow"
       WEB_APP_HOST: 127.0.0.1
       WEB_APP_PORT: "8765"
+      WB_SITE_PASSWORD: "321"
+      # Платформенные настройки (переопределяют .env если нужно)
+      # ADMIN_PIN: "321"
+      # SESSION_SECRET: "your-secret-here"
     volumes:
       - ./data:/app/data
+      - ./scripts:/app/scripts:ro
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
       - ./secrets:/run/secrets:ro
 
   caddy:
@@ -19,10 +27,14 @@ services:
     container_name: wb-sync-caddy
     restart: unless-stopped
     network_mode: host
+    environment:
+      TZ: "Europe/Moscow"
     depends_on:
       - wb-sync-web
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
       - caddy_data:/data
       - caddy_config:/config
 

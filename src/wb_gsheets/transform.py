@@ -19,7 +19,7 @@ def _article_column_idx(header: dict[str, int], article_filter_type: str) -> int
     if article_filter_type == "vendorCode":
         return _first_existing_header(
             header,
-            ("vendorCode", "Артикул поставщика", "supplierArticle", "НАШ", "SKU", "sku"),
+            ("vendorCode", "Артикул поставщика", "supplierArticle", "SKU", "sku"),
         )
     if article_filter_type == "nmId":
         return _first_existing_header(header, ("nmId", "nm_id", "Артикул WB"))
@@ -92,7 +92,7 @@ def extract_orders_filters(sheet_values: list[list[str]]) -> tuple[set[str], set
         return set(), set()
 
     header = {name.strip(): index for index, name in enumerate(sheet_values[0])}
-    supplier_idx = header.get("Артикул поставщика", header.get("НАШ"))
+    supplier_idx = header.get("Артикул поставщика")
     nm_idx = header.get("Артикул WB", header.get("nmId"))
 
     supplier_articles: set[str] = set()
@@ -187,26 +187,6 @@ def extract_filter_values(
         values.append(value)
     return values
 
-
-def extract_our_nm_ids(sheet_values: list[list[str]]) -> set[str]:
-    if not sheet_values:
-        return set()
-
-    header = {name.strip(): index for index, name in enumerate(sheet_values[0])}
-    nm_idx = _first_existing_header(header, ("Артикул WB", "nmId", "nm_id"))
-    our_idx = header.get("ИИТех")
-    if nm_idx is None or our_idx is None:
-        return set()
-
-    result: set[str] = set()
-    for row in sheet_values[1:]:
-        if len(row) <= max(nm_idx, our_idx):
-            continue
-        nm_id = row[nm_idx].strip()
-        marker = row[our_idx].strip()
-        if nm_id and marker:
-            result.add(nm_id)
-    return result
 
 
 def flatten_ads_rows(stats_payload: list[dict[str, Any]]) -> list[dict[str, Any]]:

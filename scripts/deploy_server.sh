@@ -7,7 +7,6 @@ REMOTE_APP_DIR="${REMOTE_BASE_DIR}/app"
 TMP_DIR="$(mktemp -d)"
 ARCHIVE_PATH="${TMP_DIR}/wildberries-app.tgz"
 STAGE_DIR="${TMP_DIR}/stage"
-SECRETS_DIR="${STAGE_DIR}/secrets"
 PUBLIC_PORT="${3:-18765}"
 
 cleanup() {
@@ -23,17 +22,6 @@ if [[ ! -f "$ENV_FILE" ]]; then
   exit 1
 fi
 
-SERVICE_ACCOUNT_SOURCE="$(sed -n 's/^GOOGLE_SERVICE_ACCOUNT_FILE=//p' "$ENV_FILE" | tail -n 1)"
-if [[ -z "$SERVICE_ACCOUNT_SOURCE" ]]; then
-  echo "В .env не указан GOOGLE_SERVICE_ACCOUNT_FILE" >&2
-  exit 1
-fi
-
-if [[ ! -f "$SERVICE_ACCOUNT_SOURCE" ]]; then
-  echo "Не найден файл сервисного аккаунта: ${SERVICE_ACCOUNT_SOURCE}" >&2
-  exit 1
-fi
-
 mkdir -p "$STAGE_DIR"
 cp -R \
   "${ROOT_DIR}/src" \
@@ -45,9 +33,6 @@ cp -R \
   "${ROOT_DIR}/web_app.py" \
   "$STAGE_DIR"
 
-mkdir -p "$SECRETS_DIR"
-cp "$SERVICE_ACCOUNT_SOURCE" "${SECRETS_DIR}/google-service-account.json"
-
 python3 - <<'PY' "$ENV_FILE" "${STAGE_DIR}/.env" "$PUBLIC_PORT"
 from pathlib import Path
 import sys
@@ -57,20 +42,14 @@ target_env = Path(sys.argv[2])
 public_port = sys.argv[3]
 
 rewritten = []
-has_service_account = False
 has_public_port = False
 for line in source_env:
-    if line.startswith("GOOGLE_SERVICE_ACCOUNT_FILE="):
-        rewritten.append("GOOGLE_SERVICE_ACCOUNT_FILE=/run/secrets/google-service-account.json")
-        has_service_account = True
-    elif line.startswith("WEB_PUBLIC_PORT="):
+    if line.startswith("WEB_PUBLIC_PORT="):
         rewritten.append(f"WEB_PUBLIC_PORT={public_port}")
         has_public_port = True
     else:
         rewritten.append(line)
 
-if not has_service_account:
-    rewritten.append("GOOGLE_SERVICE_ACCOUNT_FILE=/run/secrets/google-service-account.json")
 if not has_public_port:
     rewritten.append(f"WEB_PUBLIC_PORT={public_port}")
 

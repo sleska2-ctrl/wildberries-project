@@ -220,6 +220,39 @@ class SQLiteStore:
                 conn.execute(stmt, values)
             conn.commit()
 
+    def ensure_analytics_indexes(self) -> None:
+        """Create performance indexes on key analytics tables after sync."""
+        _table_indexes: dict[str, list[tuple[str, str]]] = {
+            "buyout_order_day": [("Дата", "idx_bod_date"), ("nmId", "idx_bod_nmid")],
+            "funnel_analytics": [("date", "idx_funnel_date"), ("nmId", "idx_funnel_nmid")],
+            "raw_ads": [("date", "idx_raw_ads_date"), ("nmId", "idx_raw_ads_nmid")],
+            "raw_sales": [("saleDt", "idx_raw_sales_dt"), ("nmId", "idx_raw_sales_nmid")],
+            "raw_stocks": [("nmId", "idx_raw_stocks_nmid")],
+            "analytics_article_day": [("Дата", "idx_aad_date"), ("Артикул", "idx_aad_article")],
+            "finance_article_day_detail": [("Дата", "idx_fadd_date")],
+        }
+        with self._connect() as conn:
+            existing_tables = {
+                str(r["name"]) for r in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()
+            }
+            for table, cols in _table_indexes.items():
+                if table not in existing_tables:
+                    continue
+                existing_cols = set(self._existing_columns(conn, table))
+                for col, idx_name in cols:
+                    if col not in existing_cols:
+                        continue
+                    safe_col = col.replace('"', '""')
+                    try:
+                        conn.execute(
+                            f'CREATE INDEX IF NOT EXISTS "{idx_name}" ON "{table}" ("{safe_col}")'
+                        )
+                    except Exception:
+                        pass
+            conn.commit()
+
     def list_tables(self) -> list[str]:
         with self._connect() as conn:
             rows = conn.execute(

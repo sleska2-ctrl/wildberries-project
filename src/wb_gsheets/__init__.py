@@ -1,2 +1,1 @@
-"""Wildberries to Google Sheets sync."""
-
+"""Wildberries analytics sync."""

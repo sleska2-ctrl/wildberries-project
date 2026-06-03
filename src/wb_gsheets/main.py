@@ -1,13 +1,9 @@
 from __future__ import annotations
 
 import argparse
-from pathlib import Path
-
-from openpyxl import load_workbook
 
 from .analytics import build_analytics_tables
 from .config import load_settings
-from .google_sheets import GoogleSheetsClient
 from .sqlite_store import SQLiteStore
 from .transform import (
     ads_to_sheet_rows,
@@ -15,7 +11,6 @@ from .transform import (
     build_buyout_order_day_rows,
     build_cogs_map,
     build_nm_mapping,
-    extract_our_nm_ids,
     extract_orders_filters,
     extract_filter_values,
     filter_orders_rows,
@@ -31,9 +26,6 @@ from .transform import (
 from .wb_client import WildberriesClient
 
 
-EXTERNAL_SKU_XLSX_PATH = Path(__file__).resolve().parents[2] / "data" / "sku_iitech.xlsx"
-
-
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Sync Wildberries data to SQLite")
     parser.add_argument("--date-from", dest="date_from")
@@ -46,119 +38,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--skip-ads", action="store_true")
     parser.add_argument("--skip-funnel", action="store_true")
+    parser.add_argument(
+        "--slim",
+        action="store_true",
+        help="Build only operational tables used by buyout/planning/comments pages",
+    )
     return parser
-
-
-def _clean_text(value: object) -> str:
-    return str(value or "").strip()
-
-
-def _load_external_sku_map() -> dict[str, dict[str, str]]:
-    if not EXTERNAL_SKU_XLSX_PATH.exists():
-        return {}
-
-    workbook = load_workbook(EXTERNAL_SKU_XLSX_PATH, read_only=True, data_only=True)
-    sheet = workbook[workbook.sheetnames[0]]
-    rows = list(sheet.iter_rows(values_only=True))
-    if not rows:
-        return {}
-
-    header = {_clean_text(name): idx for idx, name in enumerate(rows[0])}
-    first_idx = 0
-    nm_idx = header.get("Артикул WB")
-    subject_idx = header.get("Предмет")
-    supplier_idx = header.get("Артикул поставщика")
-    our_article_idx = header.get("НАШ")
-    name_idx = header.get("Название")
-    cogs_idx = header.get("Себестоимость")
-    commission_idx = header.get("Комиссия", header.get("Комиссии"))
-    if nm_idx is None:
-        return {}
-
-    result: dict[str, dict[str, str]] = {}
-    for row in rows[1:]:
-        if len(row) <= nm_idx:
-            continue
-        # В новом полном файле пустая первая колонка означает служебную/пустую
-        # строку. Ее не нужно добавлять в SKU.
-        if len(row) > first_idx and not _clean_text(row[first_idx]):
-            continue
-        nm_id = _clean_text(row[nm_idx])
-        if not nm_id:
-            continue
-        result[nm_id] = {
-            "subject": _clean_text(row[subject_idx]) if subject_idx is not None and len(row) > subject_idx else "",
-            "supplier_article": _clean_text(row[supplier_idx]) if supplier_idx is not None and len(row) > supplier_idx else "",
-            "our_article": _clean_text(row[our_article_idx]) if our_article_idx is not None and len(row) > our_article_idx else "",
-            "name": _clean_text(row[name_idx]) if name_idx is not None and len(row) > name_idx else "",
-            "cogs": _clean_text(row[cogs_idx]) if cogs_idx is not None and len(row) > cogs_idx else "",
-            "commission": _clean_text(row[commission_idx]) if commission_idx is not None and len(row) > commission_idx else "",
-        }
-    return result
-
-
-def _enrich_sku_values(sheet_values: list[list[str]]) -> tuple[list[list[str]], int]:
-    if not sheet_values:
-        return sheet_values, 0
-
-    external_by_nm = _load_external_sku_map()
-    if not external_by_nm:
-        return sheet_values, 0
-
-    header = [str(value).strip() for value in sheet_values[0]]
-    header_index = {name: idx for idx, name in enumerate(header)}
-
-    def ensure_column(name: str) -> int:
-        idx = header_index.get(name)
-        if idx is not None:
-            return idx
-        idx = len(header)
-        header.append(name)
-        header_index[name] = idx
-        return idx
-
-    nm_idx = ensure_column("Артикул WB")
-    subject_idx = ensure_column("Предмет")
-    supplier_idx = ensure_column("Артикул поставщика")
-    our_article_idx = ensure_column("НАШ")
-    name_idx = ensure_column("Название")
-    cogs_idx = ensure_column("себестоимость")
-    commission_idx = ensure_column("% комиссии на вб")
-    ensure_column("ИИТех")
-
-    rows = [list(row) + [""] * max(0, len(header) - len(row)) for row in sheet_values[1:]]
-    row_by_nm: dict[str, list[str]] = {}
-    for row in rows:
-        nm_id = _clean_text(row[nm_idx]) if len(row) > nm_idx else ""
-        if nm_id:
-            row_by_nm[nm_id] = row
-
-    merged = 0
-    for nm_id, payload in external_by_nm.items():
-        row = row_by_nm.get(nm_id)
-        if row is None:
-            row = [""] * len(header)
-            row[nm_idx] = nm_id
-            rows.append(row)
-            row_by_nm[nm_id] = row
-        if payload["subject"]:
-            row[subject_idx] = payload["subject"]
-        if payload["supplier_article"]:
-            row[supplier_idx] = payload["supplier_article"]
-        if payload["our_article"]:
-            row[our_article_idx] = payload["our_article"]
-        if payload["name"]:
-            row[name_idx] = payload["name"]
-        if payload["cogs"]:
-            row[cogs_idx] = payload["cogs"]
-        if payload["commission"]:
-            try:
-                row[commission_idx] = f"{float(payload['commission']) * 100:.2f}%"
-            except ValueError:
-                row[commission_idx] = payload["commission"]
-        merged += 1
-
-    return [header, *rows], merged
 
 
 def _stored_rows(store: SQLiteStore, table_name: str) -> list[dict]:
@@ -364,21 +249,12 @@ def main() -> None:
     store = SQLiteStore(settings.sqlite_db_path)
 
     cogs_values = store.get_values(settings.cogs_sheet)
-    if not cogs_values and settings.google_service_account_file and settings.google_spreadsheet_id:
-        sheets_client = GoogleSheetsClient(
-            service_account_file=settings.google_service_account_file,
-            spreadsheet_id=settings.google_spreadsheet_id,
-        )
-        cogs_values = sheets_client.get_values(settings.cogs_sheet)
     if cogs_values:
-        cogs_values, merged_sku_rows = _enrich_sku_values(cogs_values)
-        store.replace_table(settings.cogs_sheet, cogs_values)
-        print(f"[INFO] Кэширован лист {settings.cogs_sheet} из Google Sheets в SQLite")
-        if merged_sku_rows:
-            print(f"[INFO] SKU: обновлено/добавлено {merged_sku_rows} строк из {EXTERNAL_SKU_XLSX_PATH.name}")
+        print(f"[INFO] SKU: справочник прочитан из SQLite, строк {max(0, len(cogs_values) - 1)}")
+    else:
+        print(f"[WARN] SKU: таблица {settings.cogs_sheet} пуста или отсутствует в SQLite")
 
     nm_mapping = build_nm_mapping(cogs_values, article_filter_type=settings.article_filter_type)
-    our_nm_ids = extract_our_nm_ids(cogs_values)
     article_filter_values = settings.article_filter_values or extract_filter_values(cogs_values, article_filter_type=settings.article_filter_type)
     orders_supplier_articles, orders_nm_ids = extract_orders_filters(cogs_values)
 
@@ -438,27 +314,32 @@ def main() -> None:
             ads_rows = []
 
     print("[INFO] Собираем производные таблицы")
-    cogs_map = build_cogs_map(
-        sheet_values=cogs_values,
-        article_filter_type=settings.article_filter_type,
-    )
-    daily_pnl = aggregate_daily_pnl(
-        sales_rows=filtered_sales_rows,
-        ads_rows=ads_rows,
-        cogs_map=cogs_map,
-        article_filter_type=settings.article_filter_type,
-        nm_mapping=nm_mapping,
-    )
+    daily_pnl = []
+    analytics_tables = {}
+    if not args.slim:
+        cogs_map = build_cogs_map(
+            sheet_values=cogs_values,
+            article_filter_type=settings.article_filter_type,
+        )
+        daily_pnl = aggregate_daily_pnl(
+            sales_rows=filtered_sales_rows,
+            ads_rows=ads_rows,
+            cogs_map=cogs_map,
+            article_filter_type=settings.article_filter_type,
+            nm_mapping=nm_mapping,
+        )
 
-    analytics_tables = build_analytics_tables(
-        sales_rows=filtered_sales_rows,
-        ads_rows=ads_rows,
-        cogs_map=cogs_map,
-        article_filter_type=settings.article_filter_type,
-        nm_mapping=nm_mapping,
-        date_from=date_from,
-        date_to=date_to,
-    )
+        analytics_tables = build_analytics_tables(
+            sales_rows=filtered_sales_rows,
+            ads_rows=ads_rows,
+            cogs_map=cogs_map,
+            article_filter_type=settings.article_filter_type,
+            nm_mapping=nm_mapping,
+            date_from=date_from,
+            date_to=date_to,
+        )
+    else:
+        print("[INFO] Slim режим: пропускаем daily_pnl и старые аналитические витрины")
 
     store.upsert_table(
         settings.raw_sales_sheet,
@@ -478,12 +359,13 @@ def main() -> None:
     print("[INFO] Сохраняем исходные таблицы в SQLite")
     store.replace_table("raw_stocks", stocks_to_sheet_rows(filtered_stock_rows))
     print(f"[INFO] Остатки: загружено строк {len(filtered_stock_rows)}")
-    store.upsert_table(
-        settings.daily_pnl_sheet,
-        pnl_to_sheet_rows(daily_pnl),
-        key_columns=("date", "article_type", "article"),
-        update_existing=True,
-    )
+    if not args.slim:
+        store.upsert_table(
+            settings.daily_pnl_sheet,
+            pnl_to_sheet_rows(daily_pnl),
+            key_columns=("date", "article_type", "article"),
+            update_existing=True,
+        )
 
     stored_sales_rows = sheet_values_to_dicts(store.get_values(settings.raw_sales_sheet))
     stored_orders_rows = sheet_values_to_dicts(store.get_values(settings.raw_orders_sheet))
@@ -558,37 +440,41 @@ def main() -> None:
     store.replace_table("buyout_order_day", buyout_order_day_rows)
     print(f"[INFO] Таблица buyout_order_day: строк {max(0, len(buyout_order_day_rows) - 1)}")
 
-    # Derived analytics should preserve old dates and only refresh the keys
-    # that were recalculated in the current sync run.
-    print("[INFO] Обновляем аналитические таблицы")
-    store.upsert_table(
-        "finance_article_day_detail",
-        analytics_tables["finance_article_day_detail"],
-        key_columns=("Дата", "Артикул"),
-        overwrite_existing=True,
-        allow_new_columns=True,
-    )
-    store.upsert_table(
-        "analytics_article_day",
-        analytics_tables["analytics_article_day"],
-        key_columns=("Артикул", "Дата"),
-        overwrite_existing=True,
-        allow_new_columns=True,
-    )
-    store.upsert_table(
-        "analytics_day",
-        analytics_tables["analytics_day"],
-        key_columns=("Дата",),
-        overwrite_existing=True,
-        allow_new_columns=True,
-    )
-    store.upsert_table(
-        "analytics_article_period",
-        analytics_tables["analytics_article_period"],
-        key_columns=("Период с", "Период по", "Артикул"),
-        overwrite_existing=True,
-        allow_new_columns=True,
-    )
+    if not args.slim:
+        # Derived analytics should preserve old dates and only refresh the keys
+        # that were recalculated in the current sync run.
+        print("[INFO] Обновляем аналитические таблицы")
+        store.upsert_table(
+            "finance_article_day_detail",
+            analytics_tables["finance_article_day_detail"],
+            key_columns=("Дата", "Артикул"),
+            overwrite_existing=True,
+            allow_new_columns=True,
+        )
+        store.upsert_table(
+            "analytics_article_day",
+            analytics_tables["analytics_article_day"],
+            key_columns=("Артикул", "Дата"),
+            overwrite_existing=True,
+            allow_new_columns=True,
+        )
+        store.upsert_table(
+            "analytics_day",
+            analytics_tables["analytics_day"],
+            key_columns=("Дата",),
+            overwrite_existing=True,
+            allow_new_columns=True,
+        )
+        store.upsert_table(
+            "analytics_article_period",
+            analytics_tables["analytics_article_period"],
+            key_columns=("Период с", "Период по", "Артикул"),
+            overwrite_existing=True,
+            allow_new_columns=True,
+        )
+    else:
+        print("[INFO] Slim режим: старые аналитические витрины не пересобирались")
+    store.ensure_analytics_indexes()
     print("[INFO] Синхронизация завершена")
 
 

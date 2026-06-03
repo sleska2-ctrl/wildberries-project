@@ -1,3 +1,31 @@
+ewb.prprod.ru {
+	reverse_proxy 127.0.0.1:8765
+}
+
+mipao.prprod.ru {
+	reverse_proxy 127.0.0.1:8767
+}
+
+dutex.prprod.ru {
+	reverse_proxy 127.0.0.1:8768
+}
+
+hld.prprod.ru {
+	reverse_proxy 127.0.0.1:8766
+}
+
+ewb.prudnik.ru {
+	redir https://ewb.prprod.ru{uri} permanent
+}
+
+hld.prudnik.ru {
+	redir https://hld.prprod.ru{uri} permanent
+}
+
 ewb.mpaiteam.ru {
-  reverse_proxy 127.0.0.1:8765
+	redir https://ewb.prprod.ru{uri} permanent
+}
+
+hld.mpaiteam.ru {
+	redir https://hld.prprod.ru{uri} permanent
 }

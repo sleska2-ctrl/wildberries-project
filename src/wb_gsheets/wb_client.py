@@ -77,7 +77,7 @@ class WildberriesClient:
                 sleep_seconds = min(15 * (attempt + 1), 60)
                 time.sleep(sleep_seconds)
                 continue
-            if response.status_code != 429:
+            if response.status_code not in {429, 500, 502, 503, 504}:
                 response.raise_for_status()
                 return response
             sleep_seconds = self._retry_sleep_seconds(
@@ -98,11 +98,18 @@ class WildberriesClient:
         payload: dict[str, Any],
         limiter: _RateLimiter | None = None,
     ) -> requests.Response:
+        last_exc: Exception | None = None
         for attempt in range(5):
             if limiter is not None:
                 limiter.wait()
-            response = self._finance_session.post(url, json=payload, timeout=self._timeout)
-            if response.status_code != 429:
+            try:
+                response = self._finance_session.post(url, json=payload, timeout=self._timeout)
+            except (RequestsConnectionError, Timeout, SSLError) as exc:
+                last_exc = exc
+                sleep_seconds = min(15 * (attempt + 1), 60)
+                time.sleep(sleep_seconds)
+                continue
+            if response.status_code not in {429, 500, 502, 503, 504}:
                 if response.status_code != 204:
                     response.raise_for_status()
                 return response
@@ -112,6 +119,8 @@ class WildberriesClient:
                 attempt=attempt,
             )
             time.sleep(sleep_seconds)
+        if last_exc is not None:
+            raise last_exc
         response.raise_for_status()
         return response
 
@@ -133,7 +142,7 @@ class WildberriesClient:
                 sleep_seconds = min(15 * (attempt + 1), 60)
                 time.sleep(sleep_seconds)
                 continue
-            if response.status_code != 429:
+            if response.status_code not in {429, 500, 502, 503, 504}:
                 response.raise_for_status()
                 return response
             sleep_seconds = self._retry_sleep_seconds(
@@ -165,7 +174,7 @@ class WildberriesClient:
                 sleep_seconds = min(15 * (attempt + 1), 60)
                 time.sleep(sleep_seconds)
                 continue
-            if response.status_code != 429:
+            if response.status_code not in {429, 500, 502, 503, 504}:
                 response.raise_for_status()
                 return response
             sleep_seconds = self._retry_sleep_seconds(
@@ -411,3 +420,13 @@ class WildberriesClient:
                 if isinstance(payload, list):
                     all_rows.extend(payload)
         return all_rows
+
+    def start_campaign(self, advert_id: int) -> requests.Response:
+        """Launch a WB promotion campaign."""
+        url = f"{self.ADV_BASE_URL}/adv/v0/start"
+        return self._adv_get(url, params={"id": str(advert_id)}, limiter=self._adv_fast_limiter)
+
+    def pause_campaign(self, advert_id: int) -> requests.Response:
+        """Pause a WB promotion campaign."""
+        url = f"{self.ADV_BASE_URL}/adv/v0/pause"
+        return self._adv_get(url, params={"id": str(advert_id)}, limiter=self._adv_fast_limiter)

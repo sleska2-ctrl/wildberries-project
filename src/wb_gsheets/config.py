@@ -11,8 +11,6 @@ class Settings:
     wb_finance_token: str
     wb_adv_token: str
     sqlite_db_path: str
-    google_service_account_file: str
-    google_spreadsheet_id: str
     raw_sales_sheet: str
     raw_orders_sheet: str
     raw_ads_sheet: str
@@ -56,15 +54,13 @@ def load_settings() -> Settings:
     return Settings(
         wb_finance_token=wb_finance_token,
         wb_adv_token=wb_adv_token,
-        sqlite_db_path=os.getenv("SQLITE_DB_PATH", "data/wb_sync.db").strip() or "data/wb_sync.db",
-        google_service_account_file=os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE", "").strip(),
-        google_spreadsheet_id=os.getenv("GOOGLE_SPREADSHEET_ID", "").strip(),
-        raw_sales_sheet=os.getenv("GOOGLE_RAW_SALES_SHEET", "raw_sales").strip() or "raw_sales",
-        raw_orders_sheet=os.getenv("GOOGLE_RAW_ORDERS_SHEET", "raw_orders").strip() or "raw_orders",
-        raw_ads_sheet=os.getenv("GOOGLE_RAW_ADS_SHEET", "raw_ads").strip() or "raw_ads",
-        daily_pnl_sheet=os.getenv("GOOGLE_DAILY_PNL_SHEET", "daily_pnl").strip() or "daily_pnl",
-        cogs_sheet=os.getenv("GOOGLE_COGS_SHEET", "SKU").strip() or "SKU",
-        funnel_analytics_sheet=os.getenv("GOOGLE_FUNNEL_ANALYTICS_SHEET", "funnel_analytics").strip() or "funnel_analytics",
+        sqlite_db_path=os.getenv("SQLITE_DB_PATH", "data/cabs/ewb.db").strip() or "data/cabs/ewb.db",
+        raw_sales_sheet=os.getenv("RAW_SALES_TABLE", "raw_sales").strip() or "raw_sales",
+        raw_orders_sheet=os.getenv("RAW_ORDERS_TABLE", "raw_orders").strip() or "raw_orders",
+        raw_ads_sheet=os.getenv("RAW_ADS_TABLE", "raw_ads").strip() or "raw_ads",
+        daily_pnl_sheet=os.getenv("DAILY_PNL_TABLE", "daily_pnl").strip() or "daily_pnl",
+        cogs_sheet=os.getenv("SKU_TABLE", "SKU").strip() or "SKU",
+        funnel_analytics_sheet=os.getenv("FUNNEL_ANALYTICS_TABLE", "funnel_analytics").strip() or "funnel_analytics",
         article_filter_type=article_filter_type,
         article_filter_values=article_filter_values,
         default_date_from=_require("DEFAULT_DATE_FROM"),
