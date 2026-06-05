@@ -6,7 +6,7 @@
 
 ## Назначение
 
-Проект синхронизирует данные Wildberries в локальную SQLite-базу и показывает аналитику через web UI. Внешние таблицы не используются.
+Проект синхронизирует данные Wildberries и Ozon в локальные SQLite-базы и показывает аналитику через web UI. Внешние таблицы не используются.
 
 Проект собирает:
 
@@ -16,12 +16,17 @@
 - воронку продаж;
 - агрегированный `daily_pnl`;
 - расчетное планирование заказов, выкупов, выручки и остатков;
+- управление рекламными кампаниями WB через биддер start/pause;
+- контроль цен наших товаров и конкурентов;
+- задачник для операционных работ;
 - вспомогательные дашборды и сводные таблицы в SQLite/web UI.
 
 Есть два основных интерфейса:
 
 - CLI: `python -m wb_gsheets.main` или `python run_sync.py`;
 - веб-страница: `python web_app.py`, затем открыть `http://127.0.0.1:8765`.
+
+В мультикабинетном режиме данные кабинетов лежат в `data/cabs/{cabinet_id}.db`. Общие платформенные настройки, выбранный кабинет и часть служебных таблиц обслуживаются `web_app.py`.
 
 ## Стек
 
@@ -39,7 +44,11 @@
 - `src/wb_gsheets/utils.py` - Decimal, даты, chunk/window helpers.
 - `web_app.py` - локальный веб-интерфейс запуска синхронизации, аналитики и планирования.
 - `run_sync.py` - тонкая обертка над `wb_gsheets.main`.
-- `scripts/*.py` - вспомогательные скрипты проекта.
+- `scripts/ozon_sync.py` - Ozon-синхронизация и Ozon Performance API.
+- `scripts/wb_price_monitor.py` - серверный сбор цен WB.
+- `scripts/wb_price_agent.py` - агент на ноуте для live-цен WB через Chrome/CDP.
+- `scripts/wb_competitor_finder.py` - поиск конкурентов через MPSTATS.
+- `scripts/*.py` - остальные вспомогательные скрипты проекта.
 - `scripts/*.sh` - локальный запуск/остановка web UI, автозапуск, деплой.
 - `Dockerfile`, `docker-compose.yml` - контейнерный запуск web UI.
 
@@ -166,6 +175,9 @@
 - показывает расчетную страницу `/analytics/planning`;
 - отдает JSON планирования через `/api/analytics/planning`;
 - отдает Excel-выгрузку планирования через `/api/analytics/planning/export`.
+- показывает биддер на `/ads/bidder`;
+- показывает контроль цен на `/analytics/competitor-prices`;
+- показывает задачник на `/tasks`.
 
 ## Планирование
 
@@ -212,6 +224,110 @@
 - `stockout_date` - дата, когда товар закончится.
 
 Сценарии изменения цены, ДРР и конверсий сохраняются в браузере через `localStorage`. Это удобно для работы на странице, но не является серверным хранилищем и не переносится между браузерами.
+
+## WB-биддер
+
+Биддер живет в `web_app.py` и использует кабинетный WB advertising token. Это не управление ставками, а управление состоянием кампаний: `active` или `paused`.
+
+Основные функции:
+
+- `_ensure_ad_bidding_tables` - создает таблицы настроек, кэша, логов, действий и lock.
+- `_fetch_ad_articles` - ищет товары для выбора на странице.
+- `_fetch_ad_campaigns` - собирает кампании по `nmid`, метрики из `raw_ads`, настройки и последние действия.
+- `_save_ad_campaign_setting` - сохраняет бюджет, автостоп и интервал паузы по кампании.
+- `_run_ad_bidding_once_for_cabinet` - один проход исполнителя по кабинету.
+- `_run_ad_bidding_once_all` - проход по всем кабинетам с WB-рекламным токеном.
+- `_ad_executor_loop` / `_start_ad_executor` - daemon-thread, который просыпается каждый час.
+
+Таблицы:
+
+- `ad_bidding_campaign_settings` - основной источник настроек кампаний: `enabled`, `daily_budget`, `auto_pause`, `today_spend`, `pause_start`, `pause_end`.
+- `ad_campaign_cache` - кэш кампаний WB: название, статус, тип, связанные `nmId`.
+- `ad_bidding_actions` - история отправленных действий start/pause/noop/error.
+- `ad_bidding_state` - последнее желаемое состояние и последняя ошибка по `advert_id`.
+- `ad_bidding_log` - журнал для интерфейса.
+- `ad_bidding_executor_lock` - защита от параллельного исполнения.
+- `ad_bidding_global_settings`, `ad_bidding_rules`, `ad_bidding_rule_campaigns` - совместимый слой недельных правил; текущий экран в основном работает с `ad_bidding_campaign_settings`.
+
+Исполнитель:
+
+1. Берет кампании, где `enabled=1` или `auto_pause=1`.
+2. При необходимости синхронизирует расход за сегодня через `adv/v3/fullstats`; обычный интервал - не чаще 1 раза в час.
+3. Если включен автостоп и расход достиг дневного бюджета, ставит желаемое состояние `paused`.
+4. Если активен интервал паузы, ставит `paused`.
+5. Если расписание включено, пауза не активна и бюджет не превышен, ставит `active`.
+6. Не отправляет повторный start/pause, если `ad_bidding_state.last_desired_state` уже совпадает.
+7. Пишет действие и человекочитаемый лог.
+
+WB API:
+
+- `GET /adv/v1/promotion/count` - список кампаний.
+- `GET /api/advert/v2/adverts` - детали кампаний.
+- `GET /adv/v3/fullstats` - расход за день.
+- `GET /adv/v0/start?id=...` - запуск кампании.
+- `GET /adv/v0/pause?id=...` - пауза кампании.
+
+HTTP API web UI:
+
+- `GET /api/ads/articles`.
+- `GET /api/ads/campaigns`.
+- `GET /api/ads/logs`.
+- `GET/POST /api/ads/settings`.
+- `POST /api/ads/campaign-settings`.
+- `GET/POST /api/ads/rules`.
+- `POST /api/ads/rules/{id}/toggle`.
+- `POST /api/ads/executor/run-once`.
+
+## Контроль цен
+
+Цены WB не собираются из датацентра напрямую: WB internal endpoint требует браузерные cookies. Текущая схема такая:
+
+1. На ноуте запущен `scripts/wb_price_agent.py`.
+2. Агент слушает `http://100.65.13.99:8100`, сам поднимает Chrome на CDP-порту `9224` и выполняет `fetch()` в контексте страницы WB.
+3. Серверный `scripts/wb_price_monitor.py` сначала вызывает агент `GET /prices?nm=...`.
+4. Если агент недоступен, монитор использует fallback: SSH/CDP-туннель на `LOCAL_CDP`.
+5. Результат пишется в `data/wb_prices.db`.
+
+Скрипты:
+
+- `scripts/wb_price_agent.py` - ноут, HTTP `/health` и `/prices`.
+- `scripts/wb_price_monitor.py` - сервер, батчи до 50 `nmId`, пауза между батчами, `--cabinet`, `--dry-run`, `--test`, `--cdp-port`.
+- `scripts/wb_competitor_finder.py` - MPSTATS-поиск конкурентов для `hld`; использует `raw_stocks`, `raw_sales` и при наличии `wb_cards`.
+
+Таблицы `data/wb_prices.db`:
+
+- `price_history` - история цен наших товаров: `cabinet_id`, `nm_id`, `price`, `price_basic`, `rating`, `feedbacks`, `stock`.
+- `competitor_products` - связка `our_nm_id -> comp_nm_id`, название, бренд, продавец, subject и URL.
+- `competitor_prices` - история цен конкурентов: `our_nm_id`, `comp_nm_id`, `price`, `price_basic`, `stock`, `rating`, `feedbacks`.
+
+Web UI:
+
+- `/analytics/competitor-prices` - сводка по нашим товарам и конкурентам.
+- `/api/competitor-prices/summary` - агрегаты конкурентов за последние 7 дней.
+- `/api/competitor-prices/detail` - список конкурентов по товару.
+- `/api/competitor-prices/live-prices` - live-запрос цен через агента.
+- `/api/competitor-prices/costs` - себестоимость и экономические параметры из данных кабинета.
+
+## Задачник
+
+Задачник живет в `web_app.py`, страница `/tasks`.
+
+Таблица `tasks`:
+
+- `id`;
+- `title`;
+- `why`;
+- `result`;
+- `due_date`;
+- `status`: `backlog`, `in_progress`, `review`, `done`;
+- `created_at`, `updated_at`.
+
+API:
+
+- `GET /api/tasks`.
+- `POST /api/tasks`.
+- `POST /api/tasks/update`.
+- `POST /api/tasks/delete`.
 
 Локальные helper-скрипты:
 
@@ -281,6 +397,19 @@ source .venv/bin/activate
 PYTHONPATH=src python web_app.py
 ```
 
+Мониторинг цен:
+
+```bash
+python3 scripts/wb_price_monitor.py --test
+python3 scripts/wb_price_monitor.py --cabinet hld
+```
+
+Поиск конкурентов:
+
+```bash
+python3 scripts/wb_competitor_finder.py --test
+```
+
 Docker:
 
 ```bash
@@ -295,3 +424,7 @@ docker compose up -d --build
 - API рекламы медленный из-за лимитов и `sleep(20)`.
 - `raw_sales` и `raw_orders` пишутся append/upsert-логикой; повторные запуски не должны дублировать строки при корректных ключах.
 - `daily_pnl` по умолчанию только добавляет новые ключи. Для пересчета уже существующих дат может понадобиться очистка листа или изменение режима записи.
+- Биддер делает реальные запросы start/pause в WB. Перед включением автостопа проверять `daily_budget`, `pause_start`, `pause_end` и актуальность рекламного токена.
+- `ad_bidding_state` подавляет повторные действия. Если руками изменить состояние кампании в кабинете WB, кэш/состояние может временно расходиться до следующего refresh или ручного прогона.
+- Live-контроль цен зависит от ноутбука, Tailscale, Chrome-профиля и cookies WB. При `agent_unavailable` страница может показать исторические цены, но не живые.
+- `wb_price_monitor.py` пишет в отдельную базу `data/wb_prices.db`, а не в кабинетные `data/cabs/*.db`.
