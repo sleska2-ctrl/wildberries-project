@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import fcntl
+import os
 import time
+from pathlib import Path
 from typing import Any
 
 import requests
@@ -10,16 +13,47 @@ from .utils import chunked, date_windows
 
 
 class _RateLimiter:
-    def __init__(self, interval_seconds: float) -> None:
+    def __init__(self, interval_seconds: float, *, shared_name: str | None = None) -> None:
         self.interval_seconds = interval_seconds
+        self.shared_name = shared_name
         self._last_call = 0.0
 
     def wait(self) -> None:
+        if self.shared_name:
+            self._wait_shared()
+            return
         now = time.monotonic()
         delay = self.interval_seconds - (now - self._last_call)
         if delay > 0:
             time.sleep(delay)
         self._last_call = time.monotonic()
+
+    def _wait_shared(self) -> None:
+        lock_dir = Path(os.getenv("WB_RATE_LIMIT_DIR", "/tmp"))
+        lock_dir.mkdir(parents=True, exist_ok=True)
+        safe_name = "".join(ch if ch.isalnum() else "_" for ch in self.shared_name or "default")
+        lock_path = lock_dir / f"wb_api_rate_limit_{safe_name}.lock"
+        with lock_path.open("a+", encoding="utf-8") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                handle.seek(0)
+                raw_last_call = handle.read().strip()
+                try:
+                    last_call = float(raw_last_call) if raw_last_call else 0.0
+                except ValueError:
+                    last_call = 0.0
+                now = time.time()
+                delay = self.interval_seconds - (now - last_call)
+                if delay > 0:
+                    time.sleep(delay)
+                    now = time.time()
+                handle.seek(0)
+                handle.truncate()
+                handle.write(f"{now:.6f}")
+                handle.flush()
+                os.fsync(handle.fileno())
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 class WildberriesClient:
@@ -28,6 +62,8 @@ class WildberriesClient:
     STATS_BASE_URL = "https://statistics-api.wildberries.ru"
     ANALYTICS_BASE_URL = "https://seller-analytics-api.wildberries.ru"
     MINUTE_INTERVAL_SECONDS = 61.0
+    FINANCE_SALES_INTERVAL_SECONDS = float(os.getenv("WB_FINANCE_SALES_INTERVAL_SECONDS", "70"))
+    FINANCE_MAX_ATTEMPTS = int(os.getenv("WB_FINANCE_MAX_ATTEMPTS", "2"))
     ADV_FAST_INTERVAL_SECONDS = 0.21
     ADV_FULLSTATS_INTERVAL_SECONDS = 21.0
     FUNNEL_INTERVAL_SECONDS = 21.0
@@ -40,7 +76,10 @@ class WildberriesClient:
         self._stats_session = requests.Session()
         self._stats_session.headers.update({"Authorization": finance_token})
         self._timeout = timeout
-        self._finance_sales_limiter = _RateLimiter(self.MINUTE_INTERVAL_SECONDS)
+        self._finance_sales_limiter = _RateLimiter(
+            self.FINANCE_SALES_INTERVAL_SECONDS,
+            shared_name="finance_sales_reports_detailed",
+        )
         self._stats_orders_limiter = _RateLimiter(self.MINUTE_INTERVAL_SECONDS)
         self._stats_stocks_limiter = _RateLimiter(self.MINUTE_INTERVAL_SECONDS)
         self._adv_fast_limiter = _RateLimiter(self.ADV_FAST_INTERVAL_SECONDS)
@@ -55,9 +94,16 @@ class WildberriesClient:
         attempt: int,
     ) -> float:
         retry_after = response.headers.get("Retry-After")
-        if retry_after and retry_after.isdigit():
-            return float(retry_after)
+        if retry_after:
+            try:
+                return float(retry_after)
+            except ValueError:
+                pass
         return max(fallback_seconds, min(15 * (attempt + 1), 180))
+
+    def _response_excerpt(self, response: requests.Response) -> str:
+        text = (response.text or "").replace("\n", " ").strip()
+        return text[:240]
 
     def _adv_get(
         self,
@@ -99,7 +145,8 @@ class WildberriesClient:
         limiter: _RateLimiter | None = None,
     ) -> requests.Response:
         last_exc: Exception | None = None
-        for attempt in range(5):
+        attempts = max(1, self.FINANCE_MAX_ATTEMPTS)
+        for attempt in range(attempts):
             if limiter is not None:
                 limiter.wait()
             try:
@@ -118,6 +165,14 @@ class WildberriesClient:
                 fallback_seconds=limiter.interval_seconds if limiter is not None else 60,
                 attempt=attempt,
             )
+            print(
+                f"[WARN] WB finance HTTP {response.status_code}; "
+                f"пауза {sleep_seconds:.0f}с, попытка {attempt + 1}/{attempts}; "
+                f"ответ: {self._response_excerpt(response) or '-'}",
+                flush=True,
+            )
+            if attempt + 1 >= attempts:
+                break
             time.sleep(sleep_seconds)
         if last_exc is not None:
             raise last_exc
@@ -242,6 +297,63 @@ class WildberriesClient:
                 return all_rows
             seen_cursors.add(next_cursor)
             current_date_from = next_cursor
+
+    def fetch_cards(self) -> list[dict[str, Any]]:
+        """
+        Fetch all seller product cards from WB Content API.
+
+        Returns list of dicts with fields:
+          nmID, vendorCode, title, brand, subject_id, subject_name,
+          description, photos_count
+
+        Uses cursor-based pagination (limit 100 per page).
+        Requires WB API token with content access (same token as statistics).
+        """
+        url = "https://content-api.wildberries.ru/content/v2/get/cards/list"
+        session = self._stats_session  # same token works for content API
+        all_cards: list[dict[str, Any]] = []
+        cursor: dict[str, Any] = {}
+
+        while True:
+            body: dict[str, Any] = {
+                "settings": {
+                    "cursor": {**cursor, "limit": 100},
+                    "filter": {"withPhoto": -1},
+                }
+            }
+            try:
+                resp = session.post(url, json=body, timeout=self._timeout)
+                resp.raise_for_status()
+                data = resp.json()
+            except Exception as exc:
+                print(f"[WARN] fetch_cards error: {exc}")
+                break
+
+            cards = data.get("cards", [])
+            for c in cards:
+                subj = c.get("subjectName") or ""
+                subj_id = c.get("subjectID") or 0
+                all_cards.append({
+                    "nmID":         c.get("nmID"),
+                    "vendorCode":   c.get("vendorCode", ""),
+                    "title":        c.get("title", ""),
+                    "brand":        c.get("brand", ""),
+                    "subject_id":   subj_id,
+                    "subject_name": subj,
+                    "description":  (c.get("description") or "")[:500],
+                    "photos_count": len(c.get("photos") or []),
+                })
+
+            cur = data.get("cursor", {})
+            total = cur.get("total", 0)
+            updated_at = cur.get("updatedAt", "")
+            nm_id_cursor = cur.get("nmID", 0)
+
+            if len(cards) < 100 or not nm_id_cursor:
+                break
+            cursor = {"updatedAt": updated_at, "nmID": nm_id_cursor}
+
+        return all_cards
 
     def fetch_funnel_history(self, date_from: str, date_to: str, nm_ids: list[int] | None = None) -> list[dict[str, Any]]:
         """Fetch sales funnel metrics (shows, clicks, cart, orders, buyouts)."""

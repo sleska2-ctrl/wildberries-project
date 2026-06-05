@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import sqlite3
+from datetime import datetime
 from pathlib import Path
 from typing import Iterable, Sequence
 
@@ -218,7 +219,79 @@ class SQLiteStore:
                     value = row[idx] if idx < len(row) else ""
                     values.append("" if value is None else str(value))
                 conn.execute(stmt, values)
+            if resolved_table == "raw_stocks":
+                self._capture_raw_stocks_snapshot(conn, header, payload[1:])
             conn.commit()
+
+    def _capture_raw_stocks_snapshot(
+        self,
+        conn: sqlite3.Connection,
+        header: list[str],
+        rows: list[list[object]],
+    ) -> None:
+        if not {"nmId", "quantity"}.issubset(set(header)):
+            return
+        idx = {name: pos for pos, name in enumerate(header)}
+        stock_by_nm: dict[str, dict[str, object]] = {}
+        for row in rows:
+            nm_id = str(row[idx["nmId"]] if idx["nmId"] < len(row) else "").strip()
+            if not nm_id:
+                continue
+            quantity_raw = row[idx["quantity"]] if idx["quantity"] < len(row) else 0
+            try:
+                quantity = float(str(quantity_raw).replace(" ", "").replace(",", ".") or 0)
+            except ValueError:
+                quantity = 0.0
+            bucket = stock_by_nm.setdefault(
+                nm_id,
+                {
+                    "supplierArticle": "",
+                    "quantity": 0.0,
+                },
+            )
+            if not bucket["supplierArticle"] and "supplierArticle" in idx:
+                bucket["supplierArticle"] = str(
+                    row[idx["supplierArticle"]] if idx["supplierArticle"] < len(row) else ""
+                ).strip()
+            bucket["quantity"] = float(bucket["quantity"]) + quantity
+
+        if not stock_by_nm:
+            return
+
+        now = datetime.now()
+        snapshot_date = now.date().isoformat()
+        synced_at = now.isoformat(timespec="seconds")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS wb_stock_daily_snapshot (
+                snapshot_date TEXT NOT NULL,
+                nmId TEXT NOT NULL,
+                supplierArticle TEXT,
+                quantity REAL NOT NULL DEFAULT 0,
+                synced_at TEXT NOT NULL,
+                PRIMARY KEY (snapshot_date, nmId)
+            )
+            """
+        )
+        for nm_id, bucket in stock_by_nm.items():
+            conn.execute(
+                """
+                INSERT INTO wb_stock_daily_snapshot
+                  (snapshot_date, nmId, supplierArticle, quantity, synced_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(snapshot_date, nmId) DO UPDATE SET
+                  supplierArticle=excluded.supplierArticle,
+                  quantity=excluded.quantity,
+                  synced_at=excluded.synced_at
+                """,
+                (
+                    snapshot_date,
+                    nm_id,
+                    str(bucket["supplierArticle"] or ""),
+                    float(bucket["quantity"] or 0),
+                    synced_at,
+                ),
+            )
 
     def ensure_analytics_indexes(self) -> None:
         """Create performance indexes on key analytics tables after sync."""

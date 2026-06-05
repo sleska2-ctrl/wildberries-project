@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sqlite3
 import time
@@ -114,7 +115,6 @@ class OzonClient:
         self._perf_access_token: str | None = None
         self._perf_token_expires: float = 0.0
         self._last_ad_campaign_ids: set[str] = set()
-        self._sku_ad_stats_incomplete = False
         self._seller_headers = {
             "Client-Id": client_id,
             "Api-Key": api_key,
@@ -226,13 +226,20 @@ class OzonClient:
         return {}
 
     def fetch_finance_by_day(self, date_from: str, date_to: str) -> dict[str, dict[str, float]]:
-        """Returns {day: {accruals_for_sale, sale_commission, delivery_charge, return_delivery, return_accruals, for_pay}}.
+        """Returns finance facts by operation day.
+
+        The sales fact comes from OperationAgentDeliveredToCustomer. Analytics
+        API can omit delivered/return metrics for some cabinets while still
+        returning HTTP 200, so finance is the source of truth for factual
+        buyouts and accruals.
 
         delivery_charge and return_delivery are parsed from the `services` array,
         not from the top-level fields (which are always 0 in practice).
         """
         by_day: dict[str, dict[str, float]] = defaultdict(lambda: {
             "accruals_for_sale": 0.0,
+            "delivered_qty": 0.0,
+            "returns_qty": 0.0,
             "sale_commission": 0.0,
             "delivery_charge": 0.0,
             "return_delivery": 0.0,
@@ -261,9 +268,17 @@ class OzonClient:
                     if not (date_from <= op_date <= date_to):
                         continue
                     d = by_day[op_date]
-                    d["accruals_for_sale"] += float(op.get("accruals_for_sale", 0) or 0)
                     d["sale_commission"] += float(op.get("sale_commission", 0) or 0)
                     d["for_pay"] += float(op.get("amount", 0) or 0)
+                    op_type = op.get("type", "")
+                    op_name = op.get("operation_type", "")
+                    items = op.get("items") or []
+                    qty = float(len(items) or 1)
+                    if op_type == "orders" and op_name == "OperationAgentDeliveredToCustomer":
+                        d["delivered_qty"] += qty
+                        d["accruals_for_sale"] += float(op.get("accruals_for_sale", 0) or 0)
+                    elif op_type == "returns":
+                        d["returns_qty"] += qty
                     # Delivery costs are in the services array, not top-level fields
                     for svc in op.get("services", []):
                         svc_name = svc.get("name", "")
@@ -273,7 +288,6 @@ class OzonClient:
                         elif svc_name in _RETURN_DELIVERY_SERVICES:
                             d["return_delivery"] += svc_price  # negative values
                     # Return accruals: for return operations accruals_for_sale is negative
-                    op_type = op.get("type", "")
                     if op_type == "returns":
                         d["return_accruals"] += float(op.get("accruals_for_sale", 0) or 0)
                 if len(operations) < 1000:
@@ -281,6 +295,57 @@ class OzonClient:
                 page += 1
 
         return dict(by_day)
+
+    def fetch_finance_sales_by_sku_day(self, date_from: str, date_to: str) -> list[dict[str, Any]]:
+        """Returns factual delivered qty and accruals per SKU/day from transaction list."""
+        by_key: dict[tuple[str, str], dict[str, Any]] = {}
+        for window_from, window_to in _iter_month_windows(date_from, date_to):
+            month_from = f"{window_from}T00:00:00.000Z"
+            month_to = f"{window_to}T23:59:59.999Z"
+            page = 1
+            while True:
+                data = self._post("/v3/finance/transaction/list", {
+                    "filter": {
+                        "date": {"from": month_from, "to": month_to},
+                        "transaction_type": "all",
+                    },
+                    "page": page,
+                    "page_size": 1000,
+                })
+                operations = data.get("result", {}).get("operations", [])
+                if not operations:
+                    break
+                for op in operations:
+                    op_date = str(op.get("operation_date") or "")[:10]
+                    if not (date_from <= op_date <= date_to):
+                        continue
+                    if op.get("type") != "orders" or op.get("operation_type") != "OperationAgentDeliveredToCustomer":
+                        continue
+                    items = op.get("items") or []
+                    if not items:
+                        continue
+                    accrual = float(op.get("accruals_for_sale", 0) or 0)
+                    accrual_per_item = accrual / len(items) if len(items) > 1 else accrual
+                    for item in items:
+                        sku = str(item.get("sku") or "")
+                        if not sku:
+                            continue
+                        key = (op_date, sku)
+                        bucket = by_key.setdefault(key, {
+                            "day": op_date,
+                            "sku": sku,
+                            "item_name": str(item.get("name") or ""),
+                            "delivered_qty": 0,
+                            "accruals_for_sale": 0.0,
+                        })
+                        if not bucket["item_name"] and item.get("name"):
+                            bucket["item_name"] = str(item.get("name") or "")
+                        bucket["delivered_qty"] += 1
+                        bucket["accruals_for_sale"] += accrual_per_item
+                if len(operations) < 1000:
+                    break
+                page += 1
+        return list(by_key.values())
 
     def fetch_sku_accruals_by_day(self, date_from: str, date_to: str) -> list[dict[str, Any]]:
         """Returns per-SKU per-day commission and delivery using POST /v1/finance/accrual/by-day.
@@ -443,6 +508,49 @@ class OzonClient:
             if len(batch) < limit:
                 break
             offset += limit
+        return rows
+
+    def fetch_product_list(self) -> list[dict[str, Any]]:
+        """Returns full product catalog via POST /v3/product/list."""
+        rows: list[dict[str, Any]] = []
+        last_id = ""
+        limit = 1000
+        while True:
+            data = self._post("/v3/product/list", {
+                "filter": {"visibility": "ALL"},
+                "last_id": last_id,
+                "limit": limit,
+            })
+            result = data.get("result") or {}
+            items = result.get("items") or []
+            for item in items:
+                product_id = str(item.get("product_id") or item.get("id") or "")
+                offer_id = str(item.get("offer_id") or item.get("offerId") or "")
+                item_name = str(item.get("name") or item.get("title") or "")
+                sku_value = item.get("sku")
+                if isinstance(sku_value, list):
+                    sku = str(sku_value[0] or "") if sku_value else ""
+                else:
+                    sku = str(sku_value or "")
+                if not sku:
+                    sources = item.get("sources") or []
+                    if isinstance(sources, list) and sources:
+                        sku = str((sources[0] or {}).get("sku") or "")
+                rows.append({
+                    "product_id": product_id,
+                    "offer_id": offer_id,
+                    "sku": sku,
+                    "item_name": item_name,
+                    "visibility": str(item.get("visibility") or ""),
+                    "archived": int(bool(item.get("archived"))),
+                    "has_fbo_stocks": int(bool(item.get("has_fbo_stocks") or item.get("has_fbo"))),
+                    "has_fbs_stocks": int(bool(item.get("has_fbs_stocks") or item.get("has_fbs"))),
+                    "raw_json": json.dumps(item, ensure_ascii=False),
+                })
+            new_last_id = str(result.get("last_id") or "")
+            if not items or not new_last_id or new_last_id == last_id:
+                break
+            last_id = new_last_id
         return rows
 
     def fetch_sku_analytics(self, date_from: str, date_to: str) -> list[dict[str, Any]]:
@@ -666,7 +774,6 @@ class OzonClient:
                     uuid = resp.get("UUID")
                     if not uuid:
                         print(f"  [warn] SKU ad statistics {window_from}..{window_to}: no UUID in response {resp}")
-                        self._sku_ad_stats_incomplete = True
                         continue
                     print(
                         f"  SKU ad statistics {window_from}..{window_to} "
@@ -675,10 +782,6 @@ class OzonClient:
                     report = self._perf_poll_statistics_report(uuid, max_wait=600)
                 except Exception as exc:
                     print(f"  [warn] SKU ad statistics {window_from}..{window_to} chunk {i // 10 + 1}: {exc}")
-                    self._sku_ad_stats_incomplete = True
-                    continue
-                if not report:
-                    self._sku_ad_stats_incomplete = True
                     continue
                 for campaign_report in report.values():
                     rows = (campaign_report.get("report") or {}).get("rows") or []
@@ -711,6 +814,228 @@ class OzonClient:
                         bucket["ad_clicks"] += _to_int(row.get("clicks"))
         return list(by_day_sku.values())
 
+    def fetch_sku_cpo_orders_from_uuids(self, uuids: list[str], date_from: str, date_to: str) -> list[dict[str, Any]]:
+        """Returns day+SKU ad stats from already generated campaign statistics reports."""
+        if not self.perf_client_id or not self.perf_secret:
+            return []
+        by_day_sku: dict[tuple[str, str], dict[str, Any]] = {}
+        total = len(uuids)
+        for i, uuid in enumerate(uuids, start=1):
+            uuid = str(uuid or "").strip()
+            if not uuid:
+                continue
+            print(f"  Loading ready SKU ad statistics report {i}/{total} UUID: {uuid}")
+            try:
+                report = self._perf_poll_statistics_report(uuid, max_wait=120)
+            except Exception as exc:
+                print(f"  [warn] ready SKU ad statistics UUID {uuid}: {exc}")
+                continue
+            for campaign_report in report.values():
+                rows = (campaign_report.get("report") or {}).get("rows") or []
+                for row in rows:
+                    day = _parse_report_day(row.get("date"))
+                    sku = str(row.get("sku") or "")
+                    if not day or not sku or not (date_from <= day <= date_to):
+                        continue
+                    key = (day, sku)
+                    bucket = by_day_sku.setdefault(
+                        key,
+                        {
+                            "day": day,
+                            "sku": sku,
+                            "offer_id": "",
+                            "item_name": str(row.get("title") or ""),
+                            "ad_spend": 0.0,
+                            "ad_orders": 0,
+                            "ad_revenue": 0.0,
+                            "ad_views": 0,
+                            "ad_clicks": 0,
+                        },
+                    )
+                    if not bucket["item_name"] and row.get("title"):
+                        bucket["item_name"] = str(row.get("title") or "")
+                    bucket["ad_spend"] += _to_float(row.get("moneySpent"))
+                    bucket["ad_orders"] += _to_int(row.get("orders")) + _to_int(row.get("models"))
+                    bucket["ad_revenue"] += _to_float(row.get("ordersMoney")) + _to_float(row.get("modelsMoney"))
+                    bucket["ad_views"] += _to_int(row.get("views"))
+                    bucket["ad_clicks"] += _to_int(row.get("clicks"))
+        return list(by_day_sku.values())
+
+
+def sync_ads_only(
+    date_from: str,
+    date_to: str,
+    db_path: str,
+    cabinet_prefix: str,
+    report_uuids: list[str] | None = None,
+) -> None:
+    client_id = os.getenv("OZON_CLIENT_ID", "").strip()
+    api_key = os.getenv("OZON_API_KEY", "").strip()
+    perf_client_id = os.getenv("OZON_PERFORMANCE_CLIENT_ID", "").strip()
+    perf_secret = os.getenv("OZON_PERFORMANCE_CLIENT_SECRET", "").strip()
+
+    if not client_id or not api_key:
+        raise ValueError("OZON_CLIENT_ID and OZON_API_KEY must be set")
+    if not perf_client_id or not perf_secret:
+        raise ValueError("OZON_PERFORMANCE_CLIENT_ID and OZON_PERFORMANCE_CLIENT_SECRET must be set")
+
+    client = OzonClient(client_id, api_key, perf_client_id, perf_secret)
+
+    print("OZON ads-only sync.")
+    print("Fetching performance ad stats (daily)...")
+    ads = client.fetch_ad_stats_by_day(date_from, date_to)
+    print(f"  {len(ads)} days with ad data")
+
+    report_uuids = [str(uuid).strip() for uuid in (report_uuids or []) if str(uuid).strip()]
+    if report_uuids:
+        print("Fetching per-SKU/day ad statistics from ready report UUIDs...")
+        sku_day_ad_rows = client.fetch_sku_cpo_orders_from_uuids(report_uuids, date_from, date_to)
+    else:
+        print("Fetching per-SKU/day ad statistics (campaign statistics, async)...")
+        sku_day_ad_rows = client.fetch_sku_cpo_orders(date_from, date_to)
+    print(f"  {len(sku_day_ad_rows)} SKU-day rows with ad statistics")
+
+    synced_at = datetime.now(MSK).isoformat()
+    Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS ozon_daily_summary (
+                cabinet_prefix TEXT NOT NULL,
+                day TEXT NOT NULL,
+                orders_revenue REAL NOT NULL DEFAULT 0,
+                orders_qty INTEGER NOT NULL DEFAULT 0,
+                delivered_qty INTEGER NOT NULL DEFAULT 0,
+                returns_qty INTEGER NOT NULL DEFAULT 0,
+                cancellations_qty INTEGER NOT NULL DEFAULT 0,
+                accruals_for_sale REAL NOT NULL DEFAULT 0,
+                sale_commission REAL NOT NULL DEFAULT 0,
+                delivery_charge REAL NOT NULL DEFAULT 0,
+                return_delivery REAL NOT NULL DEFAULT 0,
+                return_accruals REAL NOT NULL DEFAULT 0,
+                for_pay REAL NOT NULL DEFAULT 0,
+                avg_spp REAL,
+                ad_spend REAL NOT NULL DEFAULT 0,
+                ad_impressions INTEGER NOT NULL DEFAULT 0,
+                ad_clicks INTEGER NOT NULL DEFAULT 0,
+                ad_orders INTEGER NOT NULL DEFAULT 0,
+                ad_revenue REAL NOT NULL DEFAULT 0,
+                synced_at TEXT NOT NULL,
+                PRIMARY KEY (cabinet_prefix, day)
+            )
+        """)
+        conn.execute("""
+            DELETE FROM ozon_daily_summary WHERE rowid NOT IN (
+                SELECT MIN(rowid) FROM ozon_daily_summary GROUP BY cabinet_prefix, day
+            )
+        """)
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_ozon_daily_summary_pk ON ozon_daily_summary (cabinet_prefix, day)")
+        for col, typ in [("ad_orders", "INTEGER NOT NULL DEFAULT 0"), ("ad_revenue", "REAL NOT NULL DEFAULT 0")]:
+            try:
+                conn.execute(f"ALTER TABLE ozon_daily_summary ADD COLUMN {col} {typ}")
+            except sqlite3.OperationalError:
+                pass
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS ozon_sku_day_ad_spend (
+                day TEXT NOT NULL,
+                sku TEXT NOT NULL,
+                offer_id TEXT,
+                item_name TEXT,
+                cabinet_prefix TEXT,
+                ad_spend REAL NOT NULL DEFAULT 0,
+                ad_orders INTEGER NOT NULL DEFAULT 0,
+                ad_revenue REAL NOT NULL DEFAULT 0,
+                ad_views INTEGER NOT NULL DEFAULT 0,
+                ad_clicks INTEGER NOT NULL DEFAULT 0,
+                synced_at TEXT NOT NULL,
+                PRIMARY KEY (day, sku)
+            )
+        """)
+        for col, typ in [("ad_views", "INTEGER"), ("ad_clicks", "INTEGER")]:
+            try:
+                conn.execute(f"ALTER TABLE ozon_sku_day_ad_spend ADD COLUMN {col} {typ} NOT NULL DEFAULT 0")
+            except sqlite3.OperationalError:
+                pass
+
+        conn.execute(
+            "DELETE FROM ozon_sku_day_ad_spend WHERE day >= ? AND day <= ?",
+            (date_from, date_to),
+        )
+        for row in sku_day_ad_rows:
+            conn.execute(
+                "INSERT OR REPLACE INTO ozon_sku_day_ad_spend "
+                "(day, sku, offer_id, item_name, cabinet_prefix, ad_spend, ad_orders, ad_revenue, ad_views, ad_clicks, synced_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    row["day"],
+                    row["sku"],
+                    row.get("offer_id", ""),
+                    row.get("item_name", ""),
+                    cabinet_prefix,
+                    float(row["ad_spend"]),
+                    int(row["ad_orders"]),
+                    float(row["ad_revenue"]),
+                    int(row.get("ad_views", 0)),
+                    int(row.get("ad_clicks", 0)),
+                    synced_at,
+                ),
+            )
+
+        daily_ad_rows = {
+            str(row["day"]): dict(row)
+            for row in conn.execute("""
+            SELECT
+                day,
+                COALESCE(SUM(ad_spend), 0) AS ad_spend,
+                COALESCE(SUM(ad_views), 0) AS ad_impressions,
+                COALESCE(SUM(ad_clicks), 0) AS ad_clicks,
+                COALESCE(SUM(ad_orders), 0) AS ad_orders,
+                COALESCE(SUM(ad_revenue), 0) AS ad_revenue
+            FROM ozon_sku_day_ad_spend
+            WHERE day BETWEEN ? AND ?
+            GROUP BY day
+            ORDER BY day
+        """, (date_from, date_to)).fetchall()
+        }
+
+        rows_written = 0
+        for day in sorted(set(daily_ad_rows) | set(ads)):
+            row = daily_ad_rows.get(day, {})
+            ad_day = ads.get(day, {})
+            values = (
+                float(ad_day.get("spend", row.get("ad_spend", 0)) or 0),
+                int(ad_day.get("impressions", row.get("ad_impressions", 0)) or 0),
+                int(ad_day.get("clicks", row.get("ad_clicks", 0)) or 0),
+                int(ad_day.get("orders", row.get("ad_orders", 0)) or 0),
+                float(ad_day.get("revenue", row.get("ad_revenue", 0)) or 0),
+                synced_at,
+                cabinet_prefix,
+                day,
+            )
+            conn.execute("""
+                UPDATE ozon_daily_summary
+                SET ad_spend=?,
+                    ad_impressions=?,
+                    ad_clicks=?,
+                    ad_orders=?,
+                    ad_revenue=?,
+                    synced_at=?
+                WHERE cabinet_prefix=? AND day=?
+            """, values)
+            if int(conn.execute("SELECT changes()").fetchone()[0] or 0) == 0:
+                conn.execute("""
+                    INSERT OR REPLACE INTO ozon_daily_summary
+                    (cabinet_prefix, day, ad_spend, ad_impressions, ad_clicks, ad_orders, ad_revenue, synced_at)
+                    VALUES (?,?,?,?,?,?,?,?)
+                """, (cabinet_prefix, day, *values[:5], synced_at))
+            rows_written += 1
+
+        conn.commit()
+
+    print(f"\nДобавлено/обновлено рекламных дней: {rows_written}")
+    print("Готово.")
+
 
 def sync(date_from: str, date_to: str, db_path: str, cabinet_prefix: str, skip_spp: bool = False, skip_ads: bool = False) -> None:
     client_id = os.getenv("OZON_CLIENT_ID", "").strip()
@@ -730,6 +1055,16 @@ def sync(date_from: str, date_to: str, db_path: str, cabinet_prefix: str, skip_s
     except Exception as exc:
         print(f"  [warn] Finance transactions fetch failed: {exc}")
         finance = {}
+
+    print("Fetching factual per-SKU/day buyouts from finance transactions...")
+    try:
+        sku_day_sales_facts = client.fetch_finance_sales_by_sku_day(date_from, date_to)
+        fact_qty = sum(int(r.get("delivered_qty") or 0) for r in sku_day_sales_facts)
+        fact_accruals = sum(float(r.get("accruals_for_sale") or 0) for r in sku_day_sales_facts)
+        print(f"  {len(sku_day_sales_facts)} SKU-day rows with factual buyouts, qty={fact_qty}, accruals={fact_accruals:,.2f}")
+    except Exception as exc:
+        print(f"  [warn] Factual SKU-day buyouts fetch failed: {exc}")
+        sku_day_sales_facts = []
 
     if skip_ads:
         print("Skipping performance ad stats...")
@@ -752,8 +1087,6 @@ def sync(date_from: str, date_to: str, db_path: str, cabinet_prefix: str, skip_s
     if not skip_ads:
         print("Fetching per-SKU/day ad statistics (campaign statistics, async)...")
         sku_day_ad_rows = client.fetch_sku_cpo_orders(date_from, date_to)
-        if client._sku_ad_stats_incomplete:
-            raise RuntimeError("Ozon SKU ad statistics incomplete; retry required")
         print(f"  {len(sku_day_ad_rows)} SKU-day rows with ad statistics")
         sku_day_product_stats = []
 
@@ -764,6 +1097,14 @@ def sync(date_from: str, date_to: str, db_path: str, cabinet_prefix: str, skip_s
     except Exception as exc:
         print(f"  [warn] Stock fetch failed: {exc}")
         stocks = []
+
+    print("Fetching product list...")
+    try:
+        products = client.fetch_product_list()
+        print(f"  {len(products)} products")
+    except Exception as exc:
+        print(f"  [warn] Product list fetch failed: {exc}")
+        products = []
 
     print("Fetching per-SKU analytics...")
     try:
@@ -930,10 +1271,17 @@ def sync(date_from: str, date_to: str, db_path: str, cabinet_prefix: str, skip_s
                 cabinet_prefix TEXT,
                 sale_commission REAL NOT NULL DEFAULT 0,
                 delivery_charge REAL NOT NULL DEFAULT 0,
+                delivered_qty INTEGER NOT NULL DEFAULT 0,
+                accruals_for_sale REAL NOT NULL DEFAULT 0,
                 synced_at TEXT NOT NULL,
                 PRIMARY KEY (day, sku)
             )
         """)
+        for _col, _typ in [("delivered_qty", "INTEGER NOT NULL DEFAULT 0"), ("accruals_for_sale", "REAL NOT NULL DEFAULT 0")]:
+            try:
+                conn.execute(f"ALTER TABLE ozon_sku_day_finance ADD COLUMN {_col} {_typ}")
+            except sqlite3.OperationalError:
+                pass
         conn.execute("""
             CREATE TABLE IF NOT EXISTS ozon_stock_on_warehouses (
                 sku TEXT NOT NULL,
@@ -947,25 +1295,166 @@ def sync(date_from: str, date_to: str, db_path: str, cabinet_prefix: str, skip_s
                 PRIMARY KEY (sku, warehouse_name)
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS ozon_stock_daily_snapshot (
+                cabinet_prefix TEXT NOT NULL,
+                snapshot_date TEXT NOT NULL,
+                sku TEXT NOT NULL,
+                offer_id TEXT,
+                item_name TEXT,
+                promised_amount INTEGER NOT NULL DEFAULT 0,
+                free_to_sell_amount INTEGER NOT NULL DEFAULT 0,
+                reserved_amount INTEGER NOT NULL DEFAULT 0,
+                stock INTEGER NOT NULL DEFAULT 0,
+                synced_at TEXT NOT NULL,
+                PRIMARY KEY (cabinet_prefix, snapshot_date, sku)
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS ozon_products (
+                cabinet_prefix TEXT NOT NULL,
+                product_id TEXT NOT NULL DEFAULT '',
+                offer_id TEXT NOT NULL DEFAULT '',
+                sku TEXT,
+                item_name TEXT,
+                visibility TEXT,
+                archived INTEGER NOT NULL DEFAULT 0,
+                has_fbo_stocks INTEGER NOT NULL DEFAULT 0,
+                has_fbs_stocks INTEGER NOT NULL DEFAULT 0,
+                raw_json TEXT,
+                synced_at TEXT NOT NULL,
+                PRIMARY KEY (cabinet_prefix, offer_id, product_id)
+            )
+        """)
 
         # Stock: full replace (snapshot)
         conn.execute("DELETE FROM ozon_stock_on_warehouses")
+        stock_snapshot: dict[str, dict[str, object]] = {}
         for row in stocks:
+            sku = str(row.get("sku", "")).strip()
+            offer_id = str(row.get("item_code", "")).strip()
+            item_name = str(row.get("item_name", "")).strip()
+            promised_amount = int(row.get("promised_amount", 0) or 0)
+            free_to_sell_amount = int(row.get("free_to_sell_amount", 0) or 0)
+            reserved_amount = int(row.get("reserved_amount", 0) or 0)
             conn.execute(
                 "INSERT OR REPLACE INTO ozon_stock_on_warehouses "
                 "(sku, offer_id, warehouse_name, item_name, promised_amount, free_to_sell_amount, reserved_amount, synced_at) "
                 "VALUES (?,?,?,?,?,?,?,?)",
                 (
-                    str(row.get("sku", "")),
-                    str(row.get("item_code", "")),
+                    sku,
+                    offer_id,
                     str(row.get("warehouse_name", "")),
-                    str(row.get("item_name", "")),
-                    int(row.get("promised_amount", 0) or 0),
-                    int(row.get("free_to_sell_amount", 0) or 0),
-                    int(row.get("reserved_amount", 0) or 0),
+                    item_name,
+                    promised_amount,
+                    free_to_sell_amount,
+                    reserved_amount,
                     synced_at,
                 ),
             )
+            if sku:
+                bucket = stock_snapshot.setdefault(
+                    sku,
+                    {
+                        "offer_id": offer_id,
+                        "item_name": item_name,
+                        "promised_amount": 0,
+                        "free_to_sell_amount": 0,
+                        "reserved_amount": 0,
+                    },
+                )
+                if not bucket["offer_id"]:
+                    bucket["offer_id"] = offer_id
+                if not bucket["item_name"]:
+                    bucket["item_name"] = item_name
+                bucket["promised_amount"] = int(bucket["promised_amount"]) + promised_amount
+                bucket["free_to_sell_amount"] = int(bucket["free_to_sell_amount"]) + free_to_sell_amount
+                bucket["reserved_amount"] = int(bucket["reserved_amount"]) + reserved_amount
+
+        snapshot_date = min(date_to, synced_at[:10])
+        for sku, bucket in stock_snapshot.items():
+            stock = int(bucket["free_to_sell_amount"]) + int(bucket["reserved_amount"])
+            conn.execute(
+                """
+                INSERT INTO ozon_stock_daily_snapshot
+                  (cabinet_prefix, snapshot_date, sku, offer_id, item_name,
+                   promised_amount, free_to_sell_amount, reserved_amount, stock, synced_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(cabinet_prefix, snapshot_date, sku) DO UPDATE SET
+                  offer_id=excluded.offer_id,
+                  item_name=excluded.item_name,
+                  promised_amount=excluded.promised_amount,
+                  free_to_sell_amount=excluded.free_to_sell_amount,
+                  reserved_amount=excluded.reserved_amount,
+                  stock=excluded.stock,
+                  synced_at=excluded.synced_at
+                """,
+                (
+                    cabinet_prefix,
+                    snapshot_date,
+                    sku,
+                    str(bucket["offer_id"] or ""),
+                    str(bucket["item_name"] or ""),
+                    int(bucket["promised_amount"]),
+                    int(bucket["free_to_sell_amount"]),
+                    int(bucket["reserved_amount"]),
+                    stock,
+                    synced_at,
+                ),
+            )
+
+        # Product catalog: full replace snapshot per cabinet.
+        conn.execute("DELETE FROM ozon_products WHERE cabinet_prefix = ?", (cabinet_prefix,))
+        for row in products:
+            conn.execute(
+                "INSERT OR REPLACE INTO ozon_products "
+                "(cabinet_prefix, product_id, offer_id, sku, item_name, visibility, archived, has_fbo_stocks, has_fbs_stocks, raw_json, synced_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    cabinet_prefix,
+                    str(row.get("product_id") or ""),
+                    str(row.get("offer_id") or ""),
+                    str(row.get("sku") or ""),
+                    str(row.get("item_name") or ""),
+                    str(row.get("visibility") or ""),
+                    int(row.get("archived") or 0),
+                    int(row.get("has_fbo_stocks") or 0),
+                    int(row.get("has_fbs_stocks") or 0),
+                    str(row.get("raw_json") or ""),
+                    synced_at,
+                ),
+            )
+
+        # Optional SKU enrichment: offer_id -> SKU Ozon / product_id Ozon when SKU table has these columns.
+        sku_table_exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='SKU'"
+        ).fetchone() is not None
+        if sku_table_exists:
+            sku_columns = {str(r[1]) for r in conn.execute('PRAGMA table_info("SKU")').fetchall()}
+            has_supplier_col = "Артикул поставщика" in sku_columns
+            has_ozon_sku_col = "SKU Ozon" in sku_columns
+            has_ozon_product_col = "product_id Ozon" in sku_columns
+            if has_supplier_col and (has_ozon_sku_col or has_ozon_product_col):
+                set_parts: list[str] = []
+                if has_ozon_sku_col:
+                    set_parts.append(
+                        '"SKU Ozon" = COALESCE(NULLIF((SELECT p.sku FROM ozon_products p '
+                        'WHERE p.cabinet_prefix = ? AND TRIM(COALESCE(p.offer_id,\'\')) = TRIM(COALESCE("SKU"."Артикул поставщика",\'\')) '
+                        'ORDER BY p.synced_at DESC LIMIT 1), \"\"), "SKU Ozon")'
+                    )
+                if has_ozon_product_col:
+                    set_parts.append(
+                        '"product_id Ozon" = COALESCE(NULLIF((SELECT p.product_id FROM ozon_products p '
+                        'WHERE p.cabinet_prefix = ? AND TRIM(COALESCE(p.offer_id,\'\')) = TRIM(COALESCE("SKU"."Артикул поставщика",\'\')) '
+                        'ORDER BY p.synced_at DESC LIMIT 1), \"\"), "product_id Ozon")'
+                    )
+                if set_parts:
+                    params = [cabinet_prefix] * len(set_parts)
+                    conn.execute(
+                        'UPDATE "SKU" SET ' + ', '.join(set_parts) + ' '
+                        'WHERE TRIM(COALESCE("Артикул поставщика",\'\')) != \"\"',
+                        params,
+                    )
 
         # Per-SKU daily analytics: upsert by (sku, day)
         for row in sku_day_analytics:
@@ -984,6 +1473,41 @@ def sync(date_from: str, date_to: str, db_path: str, cabinet_prefix: str, skip_s
                     int(row.get("hits_view_pdp") or 0),
                     int(row.get("hits_tocart_pdp") or 0),
                     cabinet_prefix, synced_at,
+                ),
+            )
+
+        # Finance is the source of truth for factual buyouts. Overlay it onto
+        # the SKU/day analytics table so article filters and COGS calculations
+        # use the same factual quantities as the daily summary.
+        for row in sku_day_sales_facts:
+            conn.execute(
+                """
+                INSERT INTO ozon_sku_day_analytics
+                  (sku, item_name, day, orders_revenue, orders_qty, delivered_qty,
+                   returns_qty, cancellations_qty, avg_spp, hits_view, hits_view_pdp,
+                   hits_tocart_pdp, cabinet_prefix, synced_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(sku, day) DO UPDATE SET
+                  delivered_qty=excluded.delivered_qty,
+                  item_name=COALESCE(NULLIF(ozon_sku_day_analytics.item_name, ''), excluded.item_name),
+                  cabinet_prefix=excluded.cabinet_prefix,
+                  synced_at=excluded.synced_at
+                """,
+                (
+                    str(row["sku"]),
+                    str(row.get("item_name") or ""),
+                    str(row["day"]),
+                    0.0,
+                    0,
+                    int(row.get("delivered_qty") or 0),
+                    0,
+                    0,
+                    0.0,
+                    0,
+                    0,
+                    0,
+                    cabinet_prefix,
+                    synced_at,
                 ),
             )
 
@@ -1054,6 +1578,30 @@ def sync(date_from: str, date_to: str, db_path: str, cabinet_prefix: str, skip_s
                 (row["day"], row["sku"], cabinet_prefix,
                  float(row["sale_commission"]), float(row["delivery_charge"]), synced_at),
             )
+        for row in sku_day_sales_facts:
+            conn.execute(
+                """
+                INSERT INTO ozon_sku_day_finance
+                  (day, sku, cabinet_prefix, sale_commission, delivery_charge,
+                   delivered_qty, accruals_for_sale, synced_at)
+                VALUES (?,?,?,?,?,?,?,?)
+                ON CONFLICT(day, sku) DO UPDATE SET
+                  cabinet_prefix=excluded.cabinet_prefix,
+                  delivered_qty=excluded.delivered_qty,
+                  accruals_for_sale=excluded.accruals_for_sale,
+                  synced_at=excluded.synced_at
+                """,
+                (
+                    row["day"],
+                    row["sku"],
+                    cabinet_prefix,
+                    0.0,
+                    0.0,
+                    int(row.get("delivered_qty") or 0),
+                    float(row.get("accruals_for_sale") or 0),
+                    synced_at,
+                ),
+            )
 
         # Per-SKU analytics: upsert by (sku, period)
         for row in sku_analytics:
@@ -1080,12 +1628,16 @@ def sync(date_from: str, date_to: str, db_path: str, cabinet_prefix: str, skip_s
                 s.day,
                 SUM(s.orders_revenue)    AS orders_revenue,
                 SUM(s.orders_qty)        AS orders_qty,
-                SUM(s.delivered_qty)     AS delivered_qty,
                 SUM(s.returns_qty)       AS returns_qty,
                 SUM(s.cancellations_qty) AS cancellations_qty,
                 SUM(s.hits_view)         AS hits_view,
                 SUM(s.hits_view_pdp)     AS hits_view_pdp,
                 SUM(s.hits_tocart_pdp)   AS hits_tocart_pdp,
+                CASE
+                    WHEN COALESCE(SUM(f.delivered_qty), 0) > 0 THEN SUM(f.delivered_qty)
+                    ELSE COALESCE(SUM(s.delivered_qty), 0)
+                END AS delivered_qty,
+                COALESCE(SUM(f.accruals_for_sale), 0) AS accruals_for_sale,
                 COALESCE(SUM(f.sale_commission), 0)  AS sale_commission,
                 COALESCE(SUM(f.delivery_charge), 0)  AS delivery_charge,
                 COALESCE(SUM(a.ad_spend), 0)         AS ad_spend,
@@ -1126,7 +1678,7 @@ def sync(date_from: str, date_to: str, db_path: str, cabinet_prefix: str, skip_s
                 dr["delivered_qty"],
                 dr["returns_qty"],
                 dr["cancellations_qty"],
-                dr["orders_revenue"],          # accruals_for_sale = orders_revenue per SKU sum
+                fin.get("accruals_for_sale", dr["accruals_for_sale"]) or dr["accruals_for_sale"],
                 dr["sale_commission"],
                 dr["delivery_charge"],
                 fin.get("return_delivery", 0.0),    # per-SKU not available from OZON
@@ -1197,6 +1749,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--skip-spp", action="store_true", default=True, help="Skip slow Postings API (default: true)")
     parser.add_argument("--with-spp", action="store_true", help="Enable slow Postings API for SPP")
     parser.add_argument("--skip-ads", action="store_true", help="Skip Performance API (ads) sync")
+    parser.add_argument("--ads-only", action="store_true", help="Sync only OZON Performance API ads")
+    parser.add_argument(
+        "--ad-report-uuid",
+        action="append",
+        default=[],
+        help="Use already generated OZON Performance statistics report UUID; can be repeated",
+    )
     return parser
 
 
@@ -1213,4 +1772,7 @@ if __name__ == "__main__":
     elif not cabinet_id:
         cabinet_id = "default"
     skip_spp = args.skip_spp and not args.with_spp
-    sync(args.date_from, args.date_to, db_path, cabinet_id, skip_spp=skip_spp, skip_ads=args.skip_ads)
+    if args.ads_only:
+        sync_ads_only(args.date_from, args.date_to, db_path, cabinet_id, report_uuids=args.ad_report_uuid)
+    else:
+        sync(args.date_from, args.date_to, db_path, cabinet_id, skip_spp=skip_spp, skip_ads=args.skip_ads)

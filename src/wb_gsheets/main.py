@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 
+from requests.exceptions import HTTPError
+
 from .analytics import build_analytics_tables
 from .config import load_settings
 from .sqlite_store import SQLiteStore
@@ -23,6 +25,7 @@ from .transform import (
     sheet_values_to_dicts,
     stocks_to_sheet_rows,
 )
+from .utils import to_iso_date
 from .wb_client import WildberriesClient
 
 
@@ -48,6 +51,24 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _stored_rows(store: SQLiteStore, table_name: str) -> list[dict]:
     return sheet_values_to_dicts(store.get_values(table_name))
+
+
+def _http_status(exc: Exception) -> int | None:
+    response = getattr(exc, "response", None)
+    return getattr(response, "status_code", None)
+
+
+def _rows_in_date_range(rows: list[dict], date_from: str, date_to: str, date_keys: tuple[str, ...]) -> list[dict]:
+    result: list[dict] = []
+    for row in rows:
+        row_date = ""
+        for key in date_keys:
+            row_date = to_iso_date(str(row.get(key) or ""))
+            if row_date:
+                break
+        if row_date and date_from <= row_date <= date_to:
+            result.append(row)
+    return result
 
 
 def _collect_nm_ids(*row_sets: list[dict], sku_values: list[list[str]] | None = None) -> list[int]:
@@ -102,6 +123,12 @@ def _delete_date_range(store: SQLiteStore, table_name: str, date_column: str, da
     resolved = store._table_name(table_name)  # noqa: SLF001 - internal helper keeps table names consistent.
     db_path = str(store._db_path)  # noqa: SLF001
     with sqlite3.connect(db_path) as conn:
+        exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+            (resolved,),
+        ).fetchone()
+        if exists is None:
+            return
         conn.execute(
             f'DELETE FROM "{resolved}" WHERE substr("{date_column}", 1, 10) >= ? AND substr("{date_column}", 1, 10) <= ?',
             (date_from, date_to),
@@ -191,6 +218,16 @@ def _run_single_load(
         stock_rows = wb_client.fetch_stocks()
         store.replace_table("raw_stocks", stocks_to_sheet_rows(stock_rows))
         print(f"[INFO] Остатки: загружено строк {len(stock_rows)}")
+        try:
+            print("[INFO] Загружаем карточки товаров (названия, модели, ниши)")
+            cards = wb_client.fetch_cards()
+            if cards:
+                header = ["nmID", "vendorCode", "title", "brand", "subject_id", "subject_name", "description", "photos_count"]
+                rows = [header] + [[c.get(k, "") for k in header] for c in cards]
+                store.replace_table("wb_cards", rows)
+                print(f"[INFO] Карточки: загружено {len(cards)}")
+        except Exception as exc:
+            print(f"[WARN] Не удалось загрузить карточки: {exc}")
     elif only == "ads":
         print("[INFO] Загружаем только рекламу")
         nm_ids = _collect_nm_ids(
@@ -272,8 +309,24 @@ def main() -> None:
         return
 
     print("[INFO] Загружаем продажи")
-    sales_rows = wb_client.fetch_sales_details(date_from=date_from, date_to=date_to, period="daily")
-    print(f"[INFO] Продажи: получено строк {len(sales_rows)}")
+    sales_rows_from_storage = False
+    try:
+        sales_rows = wb_client.fetch_sales_details(date_from=date_from, date_to=date_to, period="daily")
+        print(f"[INFO] Продажи: получено строк {len(sales_rows)}")
+    except HTTPError as exc:
+        if _http_status(exc) != 429:
+            raise
+        sales_rows_from_storage = True
+        sales_rows = _rows_in_date_range(
+            _stored_rows(store, settings.raw_sales_sheet),
+            date_from,
+            date_to,
+            ("saleDt", "dateTo", "dateFrom", "lastChangeDate", "sale_dt", "date_to", "date_from", "rr_dt"),
+        )
+        print(
+            "[WARN] Продажи WB finance не обновлены: API вернул 429 Too Many Requests. "
+            f"Продолжаем полный обмен на сохраненных продажах за период, строк {len(sales_rows)}"
+        )
     filtered_sales_rows = sales_rows
     print(f"[INFO] Продажи: сохраняем полный кабинет, строк {len(filtered_sales_rows)}")
 
@@ -341,11 +394,14 @@ def main() -> None:
     else:
         print("[INFO] Slim режим: пропускаем daily_pnl и старые аналитические витрины")
 
-    store.upsert_table(
-        settings.raw_sales_sheet,
-        sales_to_sheet_rows(filtered_sales_rows),
-        key_columns=("rrdId",),
-    )
+    if sales_rows_from_storage:
+        print("[WARN] raw_sales не перезаписана: использованы ранее сохраненные продажи")
+    else:
+        store.upsert_table(
+            settings.raw_sales_sheet,
+            sales_to_sheet_rows(filtered_sales_rows),
+            key_columns=("rrdId",),
+        )
     store.upsert_table(
         settings.raw_orders_sheet,
         orders_to_sheet_rows(filtered_orders_rows),
@@ -359,6 +415,19 @@ def main() -> None:
     print("[INFO] Сохраняем исходные таблицы в SQLite")
     store.replace_table("raw_stocks", stocks_to_sheet_rows(filtered_stock_rows))
     print(f"[INFO] Остатки: загружено строк {len(filtered_stock_rows)}")
+
+    try:
+        print("[INFO] Загружаем карточки товаров (названия, модели, ниши)")
+        cards = wb_client.fetch_cards()
+        if cards:
+            header = ["nmID", "vendorCode", "title", "brand", "subject_id", "subject_name", "description", "photos_count"]
+            rows = [header] + [[c.get(k, "") for k in header] for c in cards]
+            store.replace_table("wb_cards", rows)
+            print(f"[INFO] Карточки: загружено {len(cards)}")
+        else:
+            print("[WARN] Карточки: получен пустой список")
+    except Exception as exc:
+        print(f"[WARN] Не удалось загрузить карточки товаров: {exc}")
     if not args.slim:
         store.upsert_table(
             settings.daily_pnl_sheet,

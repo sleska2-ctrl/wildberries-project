@@ -34,6 +34,7 @@ LATEST_SYNC_LOG_PATH = SYNC_LOG_DIR / "latest.log"
 
 # ── Multi-cabinet platform ──────────────────────────────────────────────────
 PLATFORM_DB_PATH = str(ROOT / "data" / "platform.db")
+PRICES_DB_PATH   = str(ROOT / "data" / "wb_prices.db")
 ADMIN_PIN = os.getenv("ADMIN_PIN", "").strip()
 
 _request_local = threading.local()
@@ -117,6 +118,7 @@ REPORT_LINK_ITEMS = [
   ("/analytics/buyout-order-week", "WB по неделям"),
   ("/analytics/planning", "WB Планирование"),
   ("/analytics/comments", "WB Комментарии"),
+  ("/analytics/competitor-prices", "Цены конкурентов"),
   ("/ads/bidder", "WB Биддер"),
   ("/tasks", "Задачи"),
 ]
@@ -137,7 +139,6 @@ DISABLED_PAGE_PATHS = {
   "/analytics/article-day",
   "/analytics/preliminary-economics",
   "/analytics/preliminary-economics-summary",
-  "/ozon/upload",
   "/ozon/analytics/day",
 }
 
@@ -462,6 +463,20 @@ def _aggregate_daily_values_by_week(
     result[label] = result.get(label, 0.0) + float(values_by_date.get(day, 0.0))
   return result
 
+def _aggregate_stock_values_by_week(
+  values_by_date: dict[str, float | None],
+  daily_dates: list[str],
+  effective_from: str,
+  effective_to: str,
+) -> dict[str, float | None]:
+  result: dict[str, float | None] = {}
+  for day in daily_dates:
+    value = values_by_date.get(day)
+    if value is None:
+      continue
+    result[_week_label(day, effective_from, effective_to)] = float(value)
+  return result
+
 def _aggregate_nested_daily_values_by_week(
   values_by_date: dict[str, dict[str, float]],
   daily_dates: list[str],
@@ -569,6 +584,139 @@ def _stocks_join(conn: sqlite3.Connection) -> str:
       ") stock_data ON stock_data.nmid = buyout_order_day.\"nmId\""
     )
   return "LEFT JOIN (SELECT NULL AS nmid, NULL AS stock WHERE 0) stock_data ON 1 = 0"
+
+def _stock_row_total(raw_values: list[float | None], formatter) -> str:
+  present = [float(v) for v in raw_values if v is not None]
+  if not present:
+    return "—"
+  return f"{formatter(present[-1])} / {formatter(sum(present) / len(present))}"
+
+def _append_stock_pivot_row(
+  pivot_rows: list[dict[str, object]],
+  *,
+  group: str,
+  label: str,
+  dates: list[str],
+  values_by_date: dict[str, float | None],
+  formatter,
+  replenishment_threshold: float | None = None,
+) -> None:
+  raw_values: list[float | None] = []
+  values: list[str] = []
+  for day in dates:
+    raw = values_by_date.get(day)
+    raw_values.append(raw if raw is None else float(raw))
+    values.append("—" if raw is None else formatter(float(raw)))
+  pivot_rows.append({
+    "group": group,
+    "metric": label,
+    "total": _stock_row_total(raw_values, formatter),
+    "values": values,
+    "raw_values": raw_values,
+    "kind": "stock",
+    "color_mode": "absolute",
+    "color_threshold": max(1.0, float(replenishment_threshold if replenishment_threshold is not None else 20.0)),
+  })
+
+def _stock_values_for_output_dates(
+  values_by_date: dict[str, float],
+  *,
+  out_dates: list[str],
+  daily_dates: list[str],
+  effective_from: str,
+  effective_to: str,
+  granularity: str,
+) -> dict[str, float | None]:
+  if granularity == "week":
+    weekly = _aggregate_stock_values_by_week(values_by_date, daily_dates, effective_from, effective_to)
+    return {day: weekly.get(day) for day in out_dates}
+  return {day: values_by_date.get(day) for day in out_dates}
+
+def _fetch_wb_stock_values_by_date(
+  conn: sqlite3.Connection,
+  *,
+  effective_from: str,
+  effective_to: str,
+  article_query: str,
+  selected_articles: list[str],
+  subject: str,
+  labels: list[str],
+  revenue_category: str,
+) -> dict[str, float]:
+  def _build_common_filters(alias: str, nmid_col: str, article_col: str | None = None) -> tuple[list[str], list[object]]:
+    where: list[str] = []
+    params: list[object] = []
+    if selected_articles:
+      placeholders = ", ".join("?" for _ in selected_articles)
+      if article_col:
+        where.append(
+          f"(TRIM(CAST({alias}.{nmid_col} AS TEXT)) IN ({placeholders}) "
+          f"OR TRIM(CAST(COALESCE({alias}.{article_col}, '') AS TEXT)) IN ({placeholders}))"
+        )
+        params.extend(selected_articles)
+        params.extend(selected_articles)
+      else:
+        where.append(f"TRIM(CAST({alias}.{nmid_col} AS TEXT)) IN ({placeholders})")
+        params.extend(selected_articles)
+    elif article_query:
+      if article_query.isdigit():
+        where.append(f"TRIM(CAST({alias}.{nmid_col} AS TEXT)) = ?")
+        params.append(article_query)
+      elif article_col:
+        where.append(f"TRIM(CAST(COALESCE({alias}.{article_col}, '') AS TEXT)) = ?")
+        params.append(article_query)
+    else:
+      where.append(
+        f"TRIM(CAST({alias}.{nmid_col} AS TEXT)) IN ("
+        "SELECT TRIM(\"Артикул WB\") FROM SKU WHERE TRIM(COALESCE(\"Артикул WB\", '')) != ''"
+        ")"
+      )
+    _append_sku_attribute_filter(
+      where,
+      params,
+      f"{alias}.{nmid_col}",
+      subject=subject,
+      labels=labels,
+      revenue_category=revenue_category,
+    )
+    return where, params
+
+  if _table_exists(conn, "wb_stock_daily_snapshot"):
+    columns = _table_columns(conn, "wb_stock_daily_snapshot")
+    if {"snapshot_date", "nmId", "quantity"}.issubset(columns):
+      where, params = _build_common_filters("s", "nmId", "supplierArticle" if "supplierArticle" in columns else None)
+      where.insert(0, "s.snapshot_date >= ?")
+      where.insert(1, "s.snapshot_date <= ?")
+      params = [effective_from, effective_to, *params]
+      rows = conn.execute(
+        (
+          "SELECT s.snapshot_date AS day, SUM(CAST(s.quantity AS REAL)) AS stock "
+          "FROM wb_stock_daily_snapshot s "
+          f"WHERE {' AND '.join(where)} GROUP BY s.snapshot_date ORDER BY s.snapshot_date ASC"
+        ),
+        params,
+      ).fetchall()
+      result = {str(row["day"]): _to_float(row["stock"]) for row in rows}
+      if result:
+        return result
+
+  columns = _table_columns(conn, "raw_stocks")
+  if not {"nmId", "quantity"}.issubset(columns):
+    return {}
+  where, params = _build_common_filters("raw_stocks", "nmId", "supplierArticle" if "supplierArticle" in columns else None)
+  today = date.today().isoformat()
+  if effective_to != today:
+    return {}
+  rows = conn.execute(
+    (
+      "SELECT SUM(CAST(REPLACE(REPLACE(raw_stocks.quantity, ' ', ''), ',', '.') AS REAL)) AS stock "
+      "FROM raw_stocks "
+      f"WHERE {' AND '.join(where)}"
+    ),
+    params,
+  ).fetchall()
+  stock = _to_float(rows[0]["stock"]) if rows else 0.0
+  return {effective_to: stock} if stock else {}
 
 def _buyout_nm_join(conn: sqlite3.Connection) -> str:
   columns = _table_columns(conn, "sku")
@@ -777,7 +925,7 @@ def _fetch_buyout_order_day_pivot(
   revenue_category: str = "",
   granularity: str = "day",
 ) -> dict[str, object]:
-  dates, effective_from, effective_to = _date_range_limited(date_from, date_to, max_days=93 if granularity == "week" else 30)
+  dates, effective_from, effective_to = _date_range_limited(date_from, date_to, max_days=93 if granularity == "week" else 45)
   daily_dates = list(dates)
   where = ['buyout_order_day."Дата" >= ?', 'buyout_order_day."Дата" <= ?']
   params: list[str] = [effective_from, effective_to]
@@ -787,6 +935,7 @@ def _fetch_buyout_order_day_pivot(
   revenue_category = revenue_category.strip()
   selected_articles = [article.strip() for article in (articles or []) if article.strip()]
   has_article_filter = bool(selected_articles or article_query or subject or labels or revenue_category)
+  stock_by_date: dict[str, float] = {}
   if selected_articles:
     placeholders = ", ".join("?" for _ in selected_articles)
     where.append(
@@ -1117,6 +1266,17 @@ def _fetch_buyout_order_day_pivot(
         fallback_params,
       ).fetchall()
 
+    stock_by_date = _fetch_wb_stock_values_by_date(
+      conn,
+      effective_from=effective_from,
+      effective_to=effective_to,
+      article_query=article_query,
+      selected_articles=selected_articles,
+      subject=subject,
+      labels=labels,
+      revenue_category=revenue_category,
+    )
+
   row_dicts = [dict(row) for row in rows]
   if granularity == "week":
     dates = []
@@ -1131,6 +1291,23 @@ def _fetch_buyout_order_day_pivot(
     impression_by_date = _aggregate_daily_values_by_week(impression_by_date, daily_dates, effective_from, effective_to)
     uploaded_open_by_date = _aggregate_daily_values_by_week(uploaded_open_by_date, daily_dates, effective_from, effective_to)
     funnel_by_date = _aggregate_nested_daily_values_by_week(funnel_by_date, daily_dates, effective_from, effective_to)
+    stock_values_by_date = _stock_values_for_output_dates(
+      stock_by_date,
+      out_dates=dates,
+      daily_dates=daily_dates,
+      effective_from=effective_from,
+      effective_to=effective_to,
+      granularity=granularity,
+    )
+  else:
+    stock_values_by_date = _stock_values_for_output_dates(
+      stock_by_date,
+      out_dates=dates,
+      daily_dates=daily_dates,
+      effective_from=effective_from,
+      effective_to=effective_to,
+      granularity=granularity,
+    )
 
   by_date = {str(row["Дата"]): row for row in row_dicts}
   def day_value(day: str, key: str) -> float:
@@ -1190,6 +1367,28 @@ def _fetch_buyout_order_day_pivot(
     else:
       total_value = format_total_with_average(total, lambda value: format_money(label, value))
     pivot_rows.append({"group": group, "metric": label, "total": total_value, "values": values, "raw_values": raw_values, "kind": color_kind})
+
+  avg_sales_for_replenishment = 0.0
+  if dates:
+    avg_sales_for_replenishment = sum(
+      max(
+        day_value(day, "event_buyout_qty"),
+        day_value(day, "ordered_buyout_qty"),
+        day_value(day, "orders_qty"),
+      )
+      for day in dates
+    ) / len(dates)
+  stock_replenishment_threshold = max(3.0, avg_sales_for_replenishment * 2.0)
+
+  _append_stock_pivot_row(
+    pivot_rows,
+    group="Остатки",
+    label="Остатки, шт",
+    dates=dates,
+    values_by_date=stock_values_by_date,
+    formatter=format_number,
+    replenishment_threshold=stock_replenishment_threshold,
+  )
 
   average_check_label = "Средний чек по заказам"
   average_check_values = []
@@ -1449,7 +1648,7 @@ def _fetch_buyout_order_day_pivot(
     "rows": pivot_rows,
     "effective_from": effective_from,
     "effective_to": effective_to,
-    "max_days": 93 if granularity == "week" else 30,
+    "max_days": 93 if granularity == "week" else 45,
     "granularity": granularity,
   }
 
@@ -2342,6 +2541,19 @@ def _ad_log(
     ),
   )
 
+def _ad_money_label(value: object) -> str:
+  return f"{_to_float(value):,.0f}".replace(",", " ") + " ₽"
+
+def _ad_campaign_log_context(advert_id: str, campaign_name: str, article: str, daily_budget: object, today_spend: object) -> str:
+  clean_name = str(campaign_name or f"Кампания {advert_id}").strip()
+  clean_article = str(article or "").strip() or "—"
+  return (
+    f"Кампания: {clean_name} ({advert_id}); "
+    f"артикул: {clean_article}; "
+    f"бюджет: {_ad_money_label(daily_budget)}/день; "
+    f"расход сегодня: {_ad_money_label(today_spend)}"
+  )
+
 def _normalize_ad_schedule(schedule: object) -> dict[str, dict[str, list[list[str]]]]:
   raw_weekly = {}
   if isinstance(schedule, dict):
@@ -2488,7 +2700,7 @@ def _ad_fetch_campaign_ids(cabinet: dict | None) -> list[int]:
   data = response.json()
   result: list[int] = []
   for group in data.get("adverts", []) or []:
-    if group.get("status") not in {7, 9, 11}:
+    if group.get("status") not in {4, 9, 11}:
       continue
     for advert in group.get("advert_list", []) or []:
       advert_id = advert.get("advertId")
@@ -2591,9 +2803,11 @@ def _ad_cached_campaign_ids_for_nmid(conn: sqlite3.Connection, nmid: str) -> lis
   clean_nmid = str(nmid or "").strip()
   if not clean_nmid:
     return []
-  rows = conn.execute("SELECT advert_id, nmids_json FROM ad_campaign_cache").fetchall()
+  rows = conn.execute("SELECT advert_id, status, nmids_json FROM ad_campaign_cache").fetchall()
   result: list[str] = []
   for row in rows:
+    if str(row["status"] or "").strip() not in {"4", "9", "11"}:
+      continue
     try:
       nmids = json.loads(row["nmids_json"] or "[]")
     except Exception:
@@ -2601,22 +2815,6 @@ def _ad_cached_campaign_ids_for_nmid(conn: sqlite3.Connection, nmid: str) -> lis
     if clean_nmid in {str(item).strip() for item in nmids}:
       result.append(str(row["advert_id"]))
   return sorted({item for item in result if item.isdigit()}, key=lambda item: int(item))
-
-def _ad_raw_campaign_ids_for_nmid(conn: sqlite3.Connection, nmid: str) -> list[str]:
-  clean_nmid = str(nmid or "").strip()
-  if not clean_nmid or not _table_exists(conn, "raw_ads"):
-    return []
-  rows = conn.execute(
-    """
-    SELECT CAST("advertId" AS TEXT) AS advert_id, SUM(CAST(COALESCE("sum", "0") AS REAL)) AS spend
-    FROM raw_ads
-    WHERE CAST("nmId" AS TEXT)=?
-    GROUP BY CAST("advertId" AS TEXT)
-    ORDER BY spend DESC
-    """,
-    (clean_nmid,),
-  ).fetchall()
-  return [str(row["advert_id"]) for row in rows if str(row["advert_id"] or "").isdigit()]
 
 def _ad_campaign_action(cabinet: dict | None, advert_id: str, desired_state: str) -> tuple[str, int | None, str]:
   path = "/adv/v0/start" if desired_state == "active" else "/adv/v0/pause"
@@ -2798,13 +2996,31 @@ def _fetch_ad_logs(limit: int = 200) -> dict[str, object]:
       "SELECT id, event_type, advert_id, title, details, payload_json, created_at FROM ad_bidding_log ORDER BY id DESC LIMIT ?",
       (clean_limit,),
     ).fetchall()
+    advert_ids = sorted({str(row["advert_id"] or "").strip() for row in rows if str(row["advert_id"] or "").strip().isdigit()}, key=lambda item: int(item))
+    settings_by_id = _ad_campaign_settings_by_ids(conn, advert_ids)
+    cache_by_id = _ad_cached_campaign_details(conn, advert_ids)
   logs = []
+  today = datetime.now(AD_BIDDER_TZ).date().isoformat()
   for row in rows:
     item = dict(row)
     try:
       item["payload"] = json.loads(item.pop("payload_json") or "{}")
     except Exception:
       item["payload"] = {}
+    advert_id = str(item.get("advert_id") or "").strip()
+    details = str(item.get("details") or "")
+    if advert_id and str(item.get("event_type") or "") == "auto" and "Кампания:" not in details:
+      payload = item["payload"] if isinstance(item.get("payload"), dict) else {}
+      settings = settings_by_id.get(advert_id) or {}
+      cached = cache_by_id.get(advert_id) or {}
+      campaign_name = payload.get("campaign_name") or settings.get("name") or cached.get("name") or f"Кампания {advert_id}"
+      article = payload.get("article") or settings.get("article") or settings.get("nmid") or "—"
+      budget = payload.get("daily_budget") if "daily_budget" in payload else settings.get("daily_budget")
+      if "today_spend" in payload:
+        spend = payload.get("today_spend")
+      else:
+        spend = settings.get("today_spend") if settings and str(settings.get("spend_day") or "") == today else 0.0
+      item["details"] = _ad_campaign_log_context(advert_id, str(campaign_name or ""), str(article or ""), budget, spend) + "; " + details
     logs.append(item)
   return {"logs": logs}
 
@@ -3140,17 +3356,12 @@ def _fetch_ad_campaigns(nmid: str, days: int, refresh_details: bool = False, dat
   campaigns: list[dict[str, object]] = []
   api_error = ""
   refresh_started = False
-  advert_ids = sorted([advert_id for advert_id in metrics if str(advert_id).strip().isdigit()], key=lambda item: -_to_float(metrics[item].get("spend")))
+  advert_ids: list[str] = []
   cache_by_id: dict[str, dict[str, object]] = {}
   with _db_connect() as conn:
     _ensure_ad_bidding_tables(conn)
-    candidate_ids = set(advert_ids)
-    cached_nmid_ids = _ad_cached_campaign_ids_for_nmid(conn, nmid)
-    if cached_nmid_ids:
-      candidate_ids.update(cached_nmid_ids)
-    elif not candidate_ids:
-      candidate_ids.update(_ad_raw_campaign_ids_for_nmid(conn, nmid))
-    advert_ids = sorted(candidate_ids, key=lambda item: -_to_float(metrics.get(item, {}).get("spend")))
+    advert_ids = _ad_cached_campaign_ids_for_nmid(conn, nmid)
+    advert_ids = sorted(advert_ids, key=lambda item: -_to_float(metrics.get(item, {}).get("spend")))
     cache_by_id = _ad_cached_campaign_details(conn, advert_ids)
   if refresh_details or not cache_by_id:
     refresh_started = _ad_start_campaign_refresh(cabinet, nmid, date_from, date_to, refresh_details=refresh_details)
@@ -3207,14 +3418,9 @@ def _fetch_ad_campaigns(nmid: str, days: int, refresh_details: bool = False, dat
         elif str(last_action.get("actual_action") or "") == "start":
           campaign["status"] = "9"
       campaign["last_action"] = last_action
-    if not show_all:
-      campaigns = [
-        campaign for campaign in campaigns
-        if str(campaign.get("status") or "") == "9" or bool((campaign.get("settings") or {}).get("auto_pause") or (campaign.get("settings") or {}).get("schedule_auto"))
-      ]
     campaigns.sort(key=lambda row: (
-      0 if bool(((row.get("settings") if isinstance(row.get("settings"), dict) else {}) or {}).get("auto_pause") or ((row.get("settings") if isinstance(row.get("settings"), dict) else {}) or {}).get("schedule_auto")) else 1,
       -_to_float((row.get("metrics") or {}).get("spend") if isinstance(row.get("metrics"), dict) else 0),
+      str(row.get("name") or ""),
     ))
   return {"campaigns": campaigns, "api_error": api_error, "refresh_started": refresh_started, "show_all": show_all, "days": days, "date_from": date_from or "", "date_to": date_to or ""}
 
@@ -3420,6 +3626,10 @@ def _run_ad_bidding_once_for_cabinet(cabinet: dict | None, *, force_spend_sync: 
         advert_id = str(row["advert_id"])
         budget = _to_float(row["daily_budget"])
         today_spend = _to_float(row["today_spend"]) if str(row["spend_day"] or "") == today else 0.0
+        cache_row = conn.execute("SELECT name FROM ad_campaign_cache WHERE advert_id=?", (advert_id,)).fetchone()
+        campaign_name = str(row["name"] or (cache_row["name"] if cache_row else "") or f"Кампания {advert_id}").strip()
+        nmid = str(row["nmid"] or "").strip()
+        article = str(row["article"] or "").strip() or nmid or "—"
         over_budget = bool(row["auto_pause"]) and budget > 0 and today_spend >= budget
         pause_now = bool(row["enabled"]) and _ad_interval_active(row["pause_start"], row["pause_end"])
         if over_budget:
@@ -3458,14 +3668,32 @@ def _run_ad_bidding_once_for_cabinet(cabinet: dict | None, *, force_spend_sync: 
             "ON CONFLICT(advert_id) DO UPDATE SET last_error_at=excluded.last_error_at, last_error=excluded.last_error",
             (advert_id, now, message),
           )
-        actions_out.append({"advert_id": advert_id, "desired_state": desired_state, "actual_action": actual_action, "status_code": status_code, "message": message, "reason": reason})
+        action_payload = {
+          "advert_id": advert_id,
+          "campaign_name": campaign_name,
+          "nmid": nmid,
+          "article": article,
+          "daily_budget": budget,
+          "today_spend": today_spend,
+          "spend_day": today,
+          "desired_state": desired_state,
+          "actual_action": actual_action,
+          "status_code": status_code,
+          "message": message,
+          "reason": reason,
+        }
+        actions_out.append(action_payload)
+        log_details = (
+          _ad_campaign_log_context(advert_id, campaign_name, article, budget, today_spend)
+          + f"; причина: {reason}; целевое состояние: {desired_state}; статус: {status_code}; {message}"
+        )
         _ad_log(
           conn,
           "auto",
           advert_id,
           f"Автодействие: {actual_action}",
-          f"Причина: {reason}; целевое состояние: {desired_state}; статус: {status_code}; {message}",
-          actions_out[-1],
+          log_details,
+          action_payload,
           now,
         )
       conn.commit()
@@ -4343,7 +4571,14 @@ def run_sync(date_from: str, date_to: str, skip_ads: bool, skip_funnel: bool, lo
     except Exception as exc:
         _emit_sync_message(log_q, log_paths, "error", f"❌ {exc}")
 
-def run_ozon_sync(date_from: str, date_to: str, log_q: queue.Queue, skip_ads: bool = True, cabinet: dict | None = None) -> None:
+def run_ozon_sync(
+    date_from: str,
+    date_to: str,
+    log_q: queue.Queue,
+    skip_ads: bool = True,
+    cabinet: dict | None = None,
+    ads_only: bool = False,
+) -> None:
     cab = cabinet or {}
     cabinet_id = cab.get("cabinet_id", "default")
     db_path = _cabinet_db_path(cab)
@@ -4352,7 +4587,9 @@ def run_ozon_sync(date_from: str, date_to: str, log_q: queue.Queue, skip_ads: bo
            "--db", db_path,
            "--cabinet-id", cabinet_id,
            "--skip-spp"]
-    if skip_ads:
+    if ads_only:
+        cmd.append("--ads-only")
+    elif skip_ads:
         cmd.append("--skip-ads")
     env_patch = {
         "PYTHONUNBUFFERED": "1",
@@ -4362,8 +4599,9 @@ def run_ozon_sync(date_from: str, date_to: str, log_q: queue.Queue, skip_ads: bo
         "OZON_PERFORMANCE_CLIENT_SECRET": cab.get("ozon_performance_client_secret", ""),
     }
     env = {**os.environ, **env_patch}
-    log_paths = _sync_log_paths(date_from, date_to, f"ozon_{cabinet_id}")
-    _write_sync_log(log_paths, f"OZON синк: {date_from}..{date_to}, кабинет {cabinet_id}", reset=True)
+    mode_suffix = "ads" if ads_only else "full" if not skip_ads else "fast"
+    log_paths = _sync_log_paths(date_from, date_to, f"ozon_{cabinet_id}_{mode_suffix}")
+    _write_sync_log(log_paths, f"OZON синк: {date_from}..{date_to}, кабинет {cabinet_id}, режим {mode_suffix}", reset=True)
     try:
         _emit_sync_message(log_q, log_paths, "log", f"OZON синк: {date_from}..{date_to}")
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, cwd=str(ROOT), env=env)
@@ -4414,6 +4652,103 @@ def _ozon_label_skus(
     [*selected, date_from, date_to],
   ).fetchall()
   return {str(r["sku"]).strip() for r in rows if str(r["sku"] or "").strip()}
+
+def _fetch_ozon_stock_values_by_date(
+  conn: sqlite3.Connection,
+  *,
+  effective_from: str,
+  effective_to: str,
+  article_query: str,
+  selected_articles: list[str],
+  subject: str,
+  labels: list[str],
+  revenue_category: str,
+) -> dict[str, float]:
+  def _append_ozon_stock_filters(where: list[str], params: list[object], alias: str) -> None:
+    if subject:
+      where.append(f"{alias}.item_name = ?")
+      params.append(subject)
+    if labels:
+      label_skus = sorted(_ozon_label_skus(conn, labels, effective_from, effective_to))
+      if not label_skus:
+        where.append("1 = 0")
+      else:
+        placeholders = ", ".join("?" for _ in label_skus)
+        where.append(f"CAST({alias}.sku AS TEXT) IN ({placeholders})")
+        params.extend(label_skus)
+    if selected_articles:
+      placeholders = ", ".join("?" for _ in selected_articles)
+      where.append(
+        f"(CAST({alias}.sku AS TEXT) IN ({placeholders}) "
+        f"OR TRIM(CAST(COALESCE({alias}.offer_id, '') AS TEXT)) IN ({placeholders}))"
+      )
+      params.extend(selected_articles)
+      params.extend(selected_articles)
+    elif article_query:
+      where.append(
+        f"(CAST({alias}.sku AS TEXT) = ? "
+        f"OR TRIM(CAST(COALESCE({alias}.offer_id, '') AS TEXT)) = ?)"
+      )
+      params.extend([article_query, article_query])
+    if revenue_category:
+      where.append(
+        f"CAST({alias}.sku AS TEXT) IN ("
+        "SELECT sku FROM ("
+        "SELECT sku, SUM(orders_revenue) AS rev, "
+        "SUM(SUM(orders_revenue)) OVER (ORDER BY SUM(orders_revenue) DESC ROWS UNBOUNDED PRECEDING) AS cum, "
+        "SUM(SUM(orders_revenue)) OVER () AS total "
+        "FROM ozon_sku_day_analytics WHERE day >= ? AND day <= ? GROUP BY sku"
+        ") WHERE CASE WHEN total > 0 AND cum/total <= 0.80 THEN 'A' "
+        "WHEN total > 0 AND cum/total <= 0.95 THEN 'B' ELSE 'C' END = ?"
+        ")"
+      )
+      params.extend([effective_from, effective_to, revenue_category])
+
+  if _table_exists(conn, "ozon_stock_daily_snapshot"):
+    columns = _table_columns(conn, "ozon_stock_daily_snapshot")
+    if {"snapshot_date", "sku", "stock"}.issubset(columns):
+      where = ["s.snapshot_date >= ?", "s.snapshot_date <= ?"]
+      params: list[object] = [effective_from, effective_to]
+      _append_ozon_stock_filters(where, params, "s")
+      rows = conn.execute(
+        (
+          "SELECT s.snapshot_date AS day, SUM(CAST(s.stock AS REAL)) AS stock "
+          "FROM ozon_stock_daily_snapshot s "
+          f"WHERE {' AND '.join(where)} GROUP BY s.snapshot_date ORDER BY s.snapshot_date ASC"
+        ),
+        params,
+      ).fetchall()
+      result = {str(row["day"]): _to_float(row["stock"]) for row in rows}
+      if result:
+        # Fill-forward missing dates so sync gaps don't show as empty cells
+        d = date.fromisoformat(effective_from)
+        end = date.fromisoformat(effective_to)
+        last_val = 0.0
+        while d <= end:
+          ds = d.isoformat()
+          if ds in result:
+            last_val = result[ds]
+          elif last_val > 0:
+            result[ds] = last_val
+          d += timedelta(days=1)
+        return result
+
+  columns = _table_columns(conn, "ozon_stock_on_warehouses")
+  if not {"sku", "free_to_sell_amount", "reserved_amount", "synced_at"}.issubset(columns):
+    return {}
+  where = ["substr(s.synced_at, 1, 10) >= ?", "substr(s.synced_at, 1, 10) <= ?"]
+  params: list[object] = [effective_from, effective_to]
+  _append_ozon_stock_filters(where, params, "s")
+  rows = conn.execute(
+    (
+      "SELECT substr(s.synced_at, 1, 10) AS day, "
+      "SUM(CAST(s.free_to_sell_amount AS REAL) + CAST(s.reserved_amount AS REAL)) AS stock "
+      "FROM ozon_stock_on_warehouses s "
+      f"WHERE {' AND '.join(where)} GROUP BY day ORDER BY day ASC"
+    ),
+    params,
+  ).fetchall()
+  return {str(row["day"]): _to_float(row["stock"]) for row in rows}
 
 
 def _fetch_ozon_buyout_filter_options(
@@ -4595,7 +4930,7 @@ def _fetch_ozon_buyout_order_day_pivot(
   revenue_category: str = "",
   granularity: str = "day",
 ) -> dict[str, object]:
-  dates, effective_from, effective_to = _date_range_limited(date_from, date_to, max_days=93 if granularity == "week" else 30)
+  dates, effective_from, effective_to = _date_range_limited(date_from, date_to, max_days=93 if granularity == "week" else 45)
   daily_dates = list(dates)
   article_query = (article_query or "").strip()
   subject = (subject or "").strip()
@@ -4603,9 +4938,31 @@ def _fetch_ozon_buyout_order_day_pivot(
   revenue_category = (revenue_category or "").strip()
   selected_articles = [a.strip() for a in (articles or []) if a.strip()]
   has_article_filter = bool(selected_articles or article_query or subject or labels or revenue_category)
+  stock_by_date: dict[str, float] = {}
 
   with _db_connect() as conn:
     cogs_join = _ozon_sku_cogs_join(conn, "s")
+    finance_columns = _table_columns(conn, "ozon_sku_day_finance") if _table_exists(conn, "ozon_sku_day_finance") else []
+    if {"day", "sku"}.issubset(finance_columns):
+      finance_select_parts = [
+        "day",
+        "sku",
+        "COALESCE(sale_commission, 0) AS sale_commission" if "sale_commission" in finance_columns else "0 AS sale_commission",
+        "COALESCE(delivery_charge, 0) AS delivery_charge" if "delivery_charge" in finance_columns else "0 AS delivery_charge",
+        "COALESCE(delivered_qty, 0) AS delivered_qty" if "delivered_qty" in finance_columns else "0 AS delivered_qty",
+        "COALESCE(accruals_for_sale, 0) AS accruals_for_sale" if "accruals_for_sale" in finance_columns else "0 AS accruals_for_sale",
+      ]
+      finance_join = (
+        "LEFT JOIN (SELECT "
+        + ", ".join(finance_select_parts)
+        + " FROM ozon_sku_day_finance) f ON f.day = s.day AND f.sku = s.sku"
+      )
+    else:
+      finance_join = (
+        "LEFT JOIN (SELECT NULL AS day, NULL AS sku, 0 AS sale_commission, "
+        "0 AS delivery_charge, 0 AS delivered_qty, 0 AS accruals_for_sale WHERE 0) f "
+        "ON f.day = s.day AND f.sku = s.sku"
+      )
     if has_article_filter:
       # Per-SKU daily pivot from ozon_sku_day_analytics
       sku_where = ["s.day >= ?", "s.day <= ?"]
@@ -4629,7 +4986,7 @@ def _fetch_ozon_buyout_order_day_pivot(
             "rows": [],
             "effective_from": effective_from,
             "effective_to": effective_to,
-            "max_days": 93 if granularity == "week" else 30,
+            "max_days": 93 if granularity == "week" else 45,
             "granularity": granularity,
           }
         placeholders = ", ".join("?" for _ in label_skus)
@@ -4667,11 +5024,14 @@ def _fetch_ozon_buyout_order_day_pivot(
           SUM(s.orders_qty) AS orders_qty,
           SUM(s.delivered_qty) AS delivered_qty,
           SUM(s.cancellations_qty) AS cancellations_qty,
-          SUM(s.delivered_qty * CASE WHEN s.orders_qty > 0 THEN s.orders_revenue / s.orders_qty ELSE 0 END) AS accruals_for_sale,
+          CASE
+            WHEN COALESCE(SUM(f.accruals_for_sale), 0) > 0 THEN SUM(f.accruals_for_sale)
+            ELSE SUM(s.delivered_qty * CASE WHEN s.orders_qty > 0 THEN s.orders_revenue / s.orders_qty ELSE 0 END)
+          END AS accruals_for_sale,
           SUM(COALESCE(f.sale_commission, 0)) AS sale_commission,
           SUM(COALESCE(f.delivery_charge, 0)) AS delivery_charge,
           0 AS for_pay,
-          SUM(COALESCE(s.delivered_qty, 0) * COALESCE(cogs_data.cogs, 0)) AS cogs_total,
+          SUM(COALESCE(CASE WHEN f.delivered_qty > 0 THEN f.delivered_qty ELSE s.delivered_qty END, 0) * COALESCE(cogs_data.cogs, 0)) AS cogs_total,
           SUM(COALESCE(a.ad_spend, 0)) AS ad_spend,
           SUM(COALESCE(a.ad_views, 0)) AS ad_impressions,
           SUM(COALESCE(a.ad_clicks, 0)) AS ad_clicks,
@@ -4685,8 +5045,7 @@ def _fetch_ozon_buyout_order_day_pivot(
           ON st.sku = s.sku
         LEFT JOIN ozon_sku_day_ad_spend a
           ON a.day = s.day AND a.sku = s.sku
-        LEFT JOIN ozon_sku_day_finance f
-          ON f.day = s.day AND f.sku = s.sku
+        {finance_join}
         {cogs_join}
         WHERE {' AND '.join(sku_where)}
         GROUP BY s.day ORDER BY s.day ASC
@@ -4701,7 +5060,7 @@ def _fetch_ozon_buyout_order_day_pivot(
           SUM(s.orders_qty) AS orders_qty,
           SUM(s.delivered_qty) AS delivered_qty,
           SUM(s.cancellations_qty) AS cancellations_qty,
-          SUM(s.delivered_qty * CASE WHEN s.orders_qty > 0 THEN s.orders_revenue / s.orders_qty ELSE 0 END) AS accruals_for_sale,
+          COALESCE(ds.accruals_for_sale, 0) AS accruals_for_sale,
           COALESCE(ds.accruals_for_sale, 0) AS accruals_finance,
           COALESCE(ds.sale_commission, 0) AS sale_commission,
           COALESCE(ds.delivery_charge, 0) AS delivery_charge,
@@ -4727,6 +5086,17 @@ def _fetch_ozon_buyout_order_day_pivot(
         [effective_from, effective_to],
       ).fetchall()
 
+    stock_by_date = _fetch_ozon_stock_values_by_date(
+      conn,
+      effective_from=effective_from,
+      effective_to=effective_to,
+      article_query=article_query,
+      selected_articles=selected_articles,
+      subject=subject,
+      labels=labels,
+      revenue_category=revenue_category,
+    )
+
   sd: dict[str, dict] = {str(r["day"]): dict(r) for r in summary_rows}
   has_plugin = any(_to_float(r["hits_view"]) > 0 for r in summary_rows)
 
@@ -4747,8 +5117,24 @@ def _fetch_ozon_buyout_order_day_pivot(
                 "hits_view", "hits_view_pdp", "hits_tocart_pdp"]:
         sb[k] = sb.get(k, 0.0) + _to_float(row.get(k, 0))
     sd = w_sd
+    stock_values_by_date = _stock_values_for_output_dates(
+      stock_by_date,
+      out_dates=out_dates,
+      daily_dates=daily_dates,
+      effective_from=effective_from,
+      effective_to=effective_to,
+      granularity=granularity,
+    )
   else:
     out_dates = daily_dates
+    stock_values_by_date = _stock_values_for_output_dates(
+      stock_by_date,
+      out_dates=out_dates,
+      daily_dates=daily_dates,
+      effective_from=effective_from,
+      effective_to=effective_to,
+      granularity=granularity,
+    )
 
   def sv(day: str, key: str) -> float:
     r = sd.get(day)
@@ -4799,6 +5185,19 @@ def _fetch_ozon_buyout_order_day_pivot(
   add_simple("Штуки", "Заказы, шт", lambda d: sv(d, "orders_qty"), "number", "income")
   add_simple("Штуки", "Выкупы в эту дату, шт", lambda d: sv(d, "delivered_qty"), "number", "income")
   add_simple("Штуки", "Отмены, шт", lambda d: sv(d, "cancellations_qty"), "number", "expense")
+  avg_sales_for_replenishment = (
+    sum(max(sv(day, "delivered_qty"), sv(day, "orders_qty")) for day in out_dates) / len(out_dates)
+    if out_dates else 0.0
+  )
+  _append_stock_pivot_row(
+    pivot_rows,
+    group="Остатки",
+    label="Остатки, шт",
+    dates=out_dates,
+    values_by_date=stock_values_by_date,
+    formatter=fmt_n,
+    replenishment_threshold=max(3.0, avg_sales_for_replenishment * 2.0),
+  )
 
   avck_vals, avck_raw, t_rev, t_qty = [], [], 0.0, 0.0
   for day in out_dates:
@@ -4859,7 +5258,7 @@ def _fetch_ozon_buyout_order_day_pivot(
     "rows": pivot_rows,
     "effective_from": effective_from,
     "effective_to": effective_to,
-    "max_days": 93 if granularity == "week" else 30,
+    "max_days": 93 if granularity == "week" else 45,
     "granularity": granularity,
   }
 
@@ -5698,17 +6097,31 @@ def _fetch_ozon_planning(
     ).fetchall()
     stock_by_sku = {str(r["sku"]): _to_float(r["stock"]) for r in stock_rows}
 
-    # Our warehouse stock + cogs from SKU file table (Наш склад + Себестоимость)
-    # JOIN by "SKU Ozon" column in SKU table
-    sku_file_rows = conn.execute(
-      """
-      SELECT CAST("SKU Ozon" AS TEXT) AS ozon_sku,
-             CAST(COALESCE(NULLIF(TRIM("себестоимость"),''), '0') AS REAL) AS cogs,
-             CAST(COALESCE(NULLIF(TRIM(склад),''), '0') AS REAL) AS warehouse_stock
-      FROM SKU
-      WHERE TRIM("SKU Ozon") != ''
-      """
-    ).fetchall()
+    # Our warehouse stock + cogs from SKU file table (Наш склад + Себестоимость).
+    sku_columns = _table_columns(conn, "SKU")
+    sku_ozon_col = _first_existing(sku_columns, ["SKU Ozon", "ID товара маркетплейса", "ozon_sku", "sku", "SKU"])
+    cogs_col = _first_existing(sku_columns, ["себестоимость", "Себестоимость единицы", "cost_price", "cogs"])
+    warehouse_col = _first_existing(sku_columns, ["склад", "Склад", "Наш склад", "warehouse_stock"])
+    if sku_ozon_col:
+      cogs_expr = (
+        f"CAST(COALESCE(NULLIF(TRIM({_sql_ident(cogs_col)}),''), '0') AS REAL)"
+        if cogs_col else "0"
+      )
+      warehouse_expr = (
+        f"CAST(COALESCE(NULLIF(TRIM({_sql_ident(warehouse_col)}),''), '0') AS REAL)"
+        if warehouse_col else "0"
+      )
+      sku_file_rows = conn.execute(
+        (
+          f"SELECT CAST({_sql_ident(sku_ozon_col)} AS TEXT) AS ozon_sku, "
+          f"{cogs_expr} AS cogs, "
+          f"{warehouse_expr} AS warehouse_stock "
+          "FROM SKU "
+          f"WHERE TRIM(COALESCE({_sql_ident(sku_ozon_col)}, '')) != ''"
+        )
+      ).fetchall()
+    else:
+      sku_file_rows = []
     cogs_by_sku: dict[str, float] = {}
     wh_stock_by_sku: dict[str, float] = {}
     for r in sku_file_rows:
@@ -6506,15 +6919,23 @@ OZON_BUYOUT_ORDER_DAY_HTML = """\
     .article-table {{ width: 100%; min-width: 0; border-collapse: collapse; table-layout: fixed; font-size: 10px; }}
     .article-table th, .article-table td {{ border-bottom: 1px solid #eef2f7; padding: 3px; line-height: 1.15; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
     .article-table th {{ position: sticky; top: 0; z-index: 1; background: #f8fafc; color: #475569; font-size: .62rem; cursor: pointer; }}
-    .article-table th:first-child, .article-table td:first-child {{ text-align: left; width: 28%; }}
-    .article-table th:nth-child(2), .article-table td:nth-child(2) {{ text-align: right; width: 14%; }}
-    .article-table th:nth-child(3), .article-table td:nth-child(3) {{ text-align: right; width: 14%; }}
-    .article-table th:nth-child(4), .article-table td:nth-child(4) {{ text-align: right; width: 14%; }}
-    .article-table th:nth-child(5), .article-table td:nth-child(5) {{ text-align: right; width: 30%; }}
+    .article-table th:first-child, .article-table td:first-child {{ text-align: left; width: 44%; }}
+    .article-table th:nth-child(2), .article-table td:nth-child(2) {{ text-align: right; width: 12%; }}
+    .article-table th:nth-child(3), .article-table td:nth-child(3) {{ text-align: right; width: 12%; }}
+    .article-table th:nth-child(4), .article-table td:nth-child(4) {{ text-align: right; width: 12%; }}
+    .article-table th:nth-child(5), .article-table td:nth-child(5) {{ text-align: right; width: 20%; }}
     .article-table tr {{ cursor: default; }}
     .article-table tbody tr:hover {{ background: #f0fdfa; }}
     .article-table tbody tr.selected {{ background: #ccfbf1; font-weight: 800; color: #115e59; }}
-    .article-link {{ color: var(--accent); text-decoration: none; font-weight: 800; margin-left: 4px; }}
+    .article-name-cell {{ display: flex; align-items: center; min-width: 0; gap: 2px; }}
+    .article-name-text {{ display: flex; min-width: 0; flex: 1 1 auto; overflow: hidden; }}
+    .article-name-start {{ min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+    .article-name-end {{ flex: 0 0 auto; white-space: nowrap; }}
+    .article-actions {{ display: inline-flex; align-items: center; gap: 2px; flex: 0 0 auto; }}
+    .article-copy {{ background: none; border: none; cursor: pointer; padding: 0 1px; margin-left: 0; font-size: .8em; color: #94a3b8; opacity: .75; line-height: 1; vertical-align: middle; }}
+    .article-copy:hover {{ color: var(--accent); opacity: 1; }}
+    .article-copy.copied {{ color: #16a34a; opacity: 1; }}
+    .article-link {{ color: var(--accent); text-decoration: none; font-weight: 800; margin-left: 0; }}
     .article-link:hover {{ text-decoration: underline; }}
     .tbl table {{ width: max-content; min-width: 100%; border-collapse: collapse; font-size: 11px; }}
     .tbl th, .tbl td {{ border-bottom: 1px solid #eef2f7; padding: 6px 7px; text-align: right; white-space: nowrap; }}
@@ -6667,7 +7088,7 @@ const chartLegend = document.getElementById('chart-legend');
 const chartWrap = document.getElementById('chart-wrap');
 const workspaceEl = document.getElementById('workspace');
 const reportGranularity = '{granularity}';
-const filterKey = `ozon.analytics.buyoutOrderDay.${{reportGranularity}}.filters`;
+const filterKey = `ozon.analytics.buyoutOrderDay.v2.${{reportGranularity}}.filters`;
 let requestSeq = 0;
 let filterTimer = null;
 let selectedArticles = new Set();
@@ -7048,6 +7469,12 @@ function renderChart(data) {{
 
 function cellColorStyle(kind, prevRaw, currRaw, row) {{
   if (prevRaw === null || prevRaw === undefined || currRaw === null || currRaw === undefined) return '';
+  if (kind === 'stock') {{
+    const diff = currRaw - prevRaw;
+    const absThreshold = Number(row?.color_threshold ?? 20);
+    if (diff < absThreshold) return '';
+    return 'background:#dcfce7;color:#047857;font-weight:900;box-shadow:inset 0 0 0 1px #86efac';
+  }}
   if (String(row?.metric || '') === 'СПП') {{
     const diff = currRaw - prevRaw;
     const threshold = Number(row?.color_threshold ?? 1);
@@ -7204,6 +7631,12 @@ function renderArticles(articles) {{
     ? {{ article: item, nmid: '', stock: null, buyouts: 0, revenue: 0, drr: null, turnover: null }}
     : item
   );
+  const middleArticleHtml = (value) => {{
+    const text = String(value || '');
+    if (text.length <= 12) return `<span class="article-name-text"><span class="article-name-start">${{escapeHtml(text)}}</span></span>`;
+    const endSize = Math.min(8, Math.max(4, Math.floor(text.length * 0.35)));
+    return `<span class="article-name-text"><span class="article-name-start">${{escapeHtml(text.slice(0, -endSize))}}</span><span class="article-name-end">${{escapeHtml(text.slice(-endSize))}}</span></span>`;
+  }};
   articleItems = [...normalized].sort((left, right) => {{
     const key = articleSort.key;
     const dir = articleSort.dir === 'asc' ? 1 : -1;
@@ -7227,14 +7660,16 @@ function renderArticles(articles) {{
 	          const itemKey = String(item.nmid || item.article || '').trim();
 	          const selected = selectedArticles.has(itemKey) ? ' selected' : '';
 	          const safeArticle = escapeHtml(article);
+	          const articleName = middleArticleHtml(article);
 	          const nmid = String(item.nmid || '').trim();
-          const wbLink = /^\d+$/.test(nmid)
-            ? ``
+          const copyBtn = `<button class="article-copy" data-copy="${{safeArticle}}" data-skip-select="1" title="Скопировать артикул">⎘</button>`;
+          const ozonLink = /^\d+$/.test(nmid)
+            ? `<a class="article-link" href="https://ozon.ru/product/${{nmid}}" target="_blank" rel="noopener noreferrer" title="Открыть товар на Ozon" data-skip-select="1">↗</a>`
             : '';
           const pct = item.drr != null ? item.drr.toFixed(1) + '%' : '—';
           const turnoverStr = (item.turnover != null ? item.turnover : 999) + 'д';
 	          return `<tr class="article-item${{selected}}" data-article="${{safeArticle}}" data-key="${{escapeHtml(itemKey)}}" title="${{safeArticle}}">
-	            <td>${{safeArticle}}${{wbLink}}</td>
+	            <td><span class="article-name-cell">${{articleName}}<span class="article-actions">${{copyBtn}}${{ozonLink}}</span></span></td>
             <td>${{formatCompactNumber(item.stock)}}</td>
             <td class="drr-cell">${{pct}}</td>
             <td>${{turnoverStr}}</td>
@@ -7251,6 +7686,15 @@ function renderArticles(articles) {{
         dir: articleSort.key === key && articleSort.dir === 'desc' ? 'asc' : 'desc'
       }};
       renderArticles(normalized);
+    }});
+  }}
+  for (const btn of articleList.querySelectorAll('.article-copy')) {{
+    btn.addEventListener('click', (e) => {{
+      e.stopPropagation();
+      navigator.clipboard.writeText(btn.dataset.copy).then(() => {{
+        btn.classList.add('copied'); btn.textContent = '✓';
+        setTimeout(() => {{ btn.classList.remove('copied'); btn.textContent = '⎘'; }}, 1500);
+      }});
     }});
   }}
   for (const [idx, item] of [...articleList.querySelectorAll('.article-item')].entries()) {{
@@ -11578,7 +12022,8 @@ AD_BIDDER_HTML = """\
     .article-table tbody tr:hover {{ background:#f0fdfa; }}
     .article-table tbody tr.selected {{ background:#ccfbf1; font-weight:800; color:#115e59; }}
     .article-link,.campaign-link {{ color:var(--accent); text-decoration:none; font-weight:900; margin-left:4px; }}
-    .article-link:hover,.campaign-link:hover {{ text-decoration:underline; }}
+    .campaigns-list-link {{ color:#7c3aed; text-decoration:none; font-weight:900; margin-left:4px; }}
+    .article-link:hover,.campaign-link:hover,.campaigns-list-link:hover {{ text-decoration:underline; }}
     .article-copy {{ background:none; border:none; cursor:pointer; padding:0 1px; margin-left:3px; font-size:.8em; color:#94a3b8; opacity:.75; line-height:1; vertical-align:middle; }}
     .article-copy:hover {{ color:var(--accent); opacity:1; }}
     .article-copy.copied {{ color:#16a34a; opacity:1; }}
@@ -11598,12 +12043,18 @@ AD_BIDDER_HTML = """\
     .control-box {{ display:inline-flex; align-items:center; gap:5px; padding:4px 6px; border:1px solid #e2e8f0; border-radius:8px; background:#f8fafc; }}
     .control-box span {{ color:#64748b; font-size:.7rem; font-weight:800; }}
     .control-box.default-budget {{ border-color:#99f6e4; background:#ecfeff; }}
-    .calc-chip {{ display:inline-flex; align-items:center; padding:2px 5px; border-radius:999px; background:#ccfbf1; color:#0f766e; font-size:.64rem; font-weight:900; }}
-    .switch {{ display:inline-flex; gap:5px; align-items:center; justify-content:center; font-size:.72rem; color:#334155; white-space:nowrap; }}
-    .switch input {{ width:16px; height:16px; padding:0; accent-color:var(--accent); }}
+    .calc-chip {{ display:inline-flex; align-items:center; justify-content:center; min-width:28px; padding:2px 5px; border-radius:999px; background:#ccfbf1; color:#0f766e; font-size:.64rem; font-weight:900; }}
     .budget {{ width:72px; text-align:right; padding:5px 6px; }}
     .pause-input {{ width:74px; padding:5px 6px; }}
-    .save-row {{ padding:6px 12px; }}
+    .swipe-toggle {{ display:inline-flex; align-items:center; gap:6px; padding:0; border:0; background:transparent; color:#334155; font-size:.72rem; font-weight:800; white-space:nowrap; cursor:grab; touch-action:pan-y; user-select:none; }}
+    .swipe-toggle:active {{ cursor:grabbing; }}
+    .swipe-toggle:focus-visible {{ outline:2px solid #99f6e4; outline-offset:3px; border-radius:999px; }}
+    .swipe-track {{ position:relative; width:34px; height:18px; border-radius:999px; background:#e2e8f0; box-shadow:inset 0 0 0 1px #cbd5e1; transition:background .16s ease,box-shadow .16s ease; flex:0 0 auto; }}
+    .swipe-thumb {{ position:absolute; left:2px; top:2px; width:14px; height:14px; border-radius:50%; background:#fff; box-shadow:0 1px 3px rgba(15,23,42,.22); transition:transform .16s ease; }}
+    .swipe-toggle.is-on .swipe-track {{ background:#0f766e; box-shadow:inset 0 0 0 1px #0f766e; }}
+    .swipe-toggle.is-on .swipe-thumb {{ transform:translateX(16px); }}
+    .swipe-toggle.is-saving {{ opacity:.68; }}
+    .swipe-label {{ color:#334155; }}
     .type-chip {{ display:inline-flex; align-items:center; padding:2px 6px; border-radius:6px; background:#f1f5f9; color:#334155; font-size:.68rem; font-weight:800; }}
     .nm-count {{ display:inline-flex; align-items:center; padding:2px 6px; border-radius:999px; background:#ecfdf5; color:#047857; font-size:.68rem; font-weight:900; }}
     .nm-count.multi {{ background:#fee2e2; color:#991b1b; }}
@@ -11666,7 +12117,6 @@ AD_BIDDER_HTML = """\
           <button type="button" data-quick-period="7">7</button>
           <button type="button" data-quick-period="14">14</button>
         </div>
-        <label class="switch" style="margin-bottom:6px;"><input id="show-all-campaigns" type="checkbox">все кампании</label>
         <button id="run" class="ghost" type="button">Проверить</button>
         <button id="refresh" class="gray" type="button">Обновить из API</button>
         <div id="status" class="status"></div>
@@ -11757,7 +12207,6 @@ const revenueCategoryEl = document.getElementById('revenue-category');
 const campaignsEl = document.getElementById('campaigns');
 const statusEl = document.getElementById('status');
 const adLogEl = document.getElementById('ad-log');
-const showAllCampaignsEl = document.getElementById('show-all-campaigns');
 const SERVER_TODAY = '{today_date}';
 function escapeHtml(value) {{
   return String(value ?? '').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;').replaceAll("'",'&#39;');
@@ -11875,8 +12324,11 @@ function renderArticles(items) {{
         const wbLink = /^\\d+$/.test(nmid)
           ? `<a class="article-link" href="https://www.wildberries.ru/catalog/${{nmid}}/detail.aspx" target="_blank" rel="noopener noreferrer" title="Открыть товар на WB" data-skip-select="1">↗</a>`
           : '';
+        const campaignsListLink = /^\\d+$/.test(nmid)
+          ? `<a class="campaigns-list-link" href="https://cmp.wildberries.ru/campaigns/list?search=${{nmid}}" target="_blank" rel="noopener noreferrer" title="Рекламные кампании WB" data-skip-select="1">р</a>`
+          : '';
         return `<tr class="article-item${{selected}}" data-nmid="${{escapeHtml(item.nmid)}}" data-article="${{escapeHtml(item.article)}}" data-name="${{escapeHtml(item.name || '')}}" title="${{escapeHtml(item.article || item.nmid)}}">
-          <td>${{safeArticle}}${{copyBtn}}${{wbLink}}</td>
+          <td>${{safeArticle}}${{copyBtn}}${{wbLink}}${{campaignsListLink}}</td>
           <td>${{fmt(item.stock)}}</td>
           <td>${{drr}}</td>
           <td>${{turnover}}</td>
@@ -11950,27 +12402,65 @@ function rowState(c) {{
 }}
 function wbState(c) {{
   const status = String(c.status || '');
+  if (status === '4') return '<span class="pill" title="WB статус 4">готова</span>';
   if (status === '9') return '<span class="pill on" title="WB статус 9">активна</span>';
   if (status === '11') return '<span class="pill off" title="WB статус 11">пауза</span>';
   if (status === '7') return '<span class="pill off" title="WB статус 7">завершена</span>';
   return `<span class="pill" title="WB статус ${{escapeHtml(status || '—')}}">WB ${{escapeHtml(status || '—')}}</span>`;
 }}
 function campaignSortValue(c) {{
-  const s = c.settings || {{}};
-  const automated = Boolean(s.auto_pause || s.schedule_auto || s.enabled);
   const spend = Number((c.metrics || {{}}).spend || 0);
-  return [automated ? 0 : 1, -spend];
+  return [-spend, String(c.name || '')];
 }}
 function sortCampaigns(items) {{
   return [...items].sort((left, right) => {{
     const a = campaignSortValue(left);
     const b = campaignSortValue(right);
-    return (a[0] - b[0]) || (a[1] - b[1]) || String(left.name || '').localeCompare(String(right.name || ''), 'ru');
+    return (a[0] - b[0]) || String(a[1] || '').localeCompare(String(b[1] || ''), 'ru');
   }});
 }}
+function budgetPctLabel(budget, avgOrders) {{
+  const avg = Number(avgOrders || 0);
+  if (avg <= 0) return '—%';
+  const pct = Number(budget || 0) / avg * 100;
+  if (!Number.isFinite(pct)) return '—%';
+  const digits = Math.abs(pct) < 10 ? 1 : 0;
+  return pct.toFixed(digits).replace(/\\.0$/, '') + '%';
+}}
+function budgetPctTitle(budget, avgOrders) {{
+  const avg = Number(avgOrders || 0);
+  if (avg <= 0) return 'Нет средней суммы заказов за 7 дней';
+  return `Бюджет ${{fmt(budget)}} ₽ = ${{budgetPctLabel(budget, avg)}} от средней суммы заказов за 7 дней ${{fmt(avg)}} ₽`;
+}}
+function syncBudgetPct(row) {{
+  const input = row && row.querySelector('.budget');
+  const chip = row && row.querySelector('.calc-chip');
+  const box = row && row.querySelector('.control-box');
+  if (!input || !chip) return;
+  const avg = Number(chip.dataset.avgOrders || 0);
+  const budget = Number(input.value || 0);
+  chip.textContent = budgetPctLabel(budget, avg);
+  if (box) box.title = budgetPctTitle(budget, avg);
+}}
+function swipeToggleHtml(cls, checked, label, title) {{
+  const on = Boolean(checked);
+  return `<button class="swipe-toggle ${{cls}}${{on ? ' is-on' : ''}}" type="button" role="switch" aria-checked="${{on ? 'true' : 'false'}}" data-checked="${{on ? '1' : '0'}}" title="${{escapeHtml(title || label)}}">
+    <span class="swipe-track" aria-hidden="true"><span class="swipe-thumb"></span></span>
+    <span class="swipe-label">${{escapeHtml(label)}}</span>
+  </button>`;
+}}
+function swipeToggleValue(row, selector) {{
+  const el = row.querySelector(selector);
+  return Boolean(el && el.dataset.checked === '1');
+}}
+function setSwipeToggle(el, checked) {{
+  const on = Boolean(checked);
+  el.dataset.checked = on ? '1' : '0';
+  el.setAttribute('aria-checked', on ? 'true' : 'false');
+  el.classList.toggle('is-on', on);
+}}
 function renderCampaigns(data) {{
-  const showAll = Boolean(showAllCampaignsEl && showAllCampaignsEl.checked);
-  campaigns = sortCampaigns((data.campaigns || []).filter(c => showAll || String(c.status || '') === '9' || Boolean((c.settings || {{}}).auto_pause || (c.settings || {{}}).schedule_auto)));
+  campaigns = sortCampaigns(data.campaigns || []);
   campaignsEl.innerHTML = campaigns.length
     ? campaigns.map(c => {{
         const m = c.metrics || {{}};
@@ -11978,7 +12468,10 @@ function renderCampaigns(data) {{
         const last = c.last_action ? `${{c.last_action.actual_action || ''}} ${{c.last_action.status_code || ''}}` : '';
         const type = c.type || '—';
         const nmCount = Number(c.nm_count || 0);
-        const budgetTitle = s.daily_budget_is_default ? `Расчет: средняя сумма заказов за 7 дней ${{fmt(s.avg_orders_7d)}} × 2%` : '';
+        const budgetValue = Number(s.daily_budget || 0);
+        const avgOrders = Number(s.avg_orders_7d || 0);
+        const budgetTitle = budgetPctTitle(budgetValue, avgOrders);
+        const budgetPct = budgetPctLabel(budgetValue, avgOrders);
         const nmCountHtml = nmCount ? `<span class="nm-count${{nmCount > 1 ? ' multi' : ''}}" title="Товаров в кампании">${{nmCount}} SKU</span>` : '<span class="nm-count" title="Количество товаров неизвестно">?</span>';
         const campaignUrl = `https://cmp.wildberries.ru/campaigns/edit/${{encodeURIComponent(c.advert_id)}}`;
         return `<tr data-advert-id="${{escapeHtml(c.advert_id)}}">
@@ -11986,15 +12479,14 @@ function renderCampaigns(data) {{
           <td><span class="type-chip">${{escapeHtml(type)}}</span><div class="meta" style="margin-top:3px;">${{nmCountHtml}}</div></td>
           <td>
             <div class="row-controls">
-              <span class="control-box${{s.daily_budget_is_default ? ' default-budget' : ''}}" title="${{escapeHtml(budgetTitle)}}"><span>₽/день</span><input class="budget" type="number" min="0" step="100" value="${{Number(s.daily_budget || 0)}}">${{s.daily_budget_is_default ? '<span class="calc-chip">2%</span>' : ''}}</span>
-              <label class="switch"><input class="row-autopause" type="checkbox"${{s.auto_pause ? ' checked' : ''}}>автовыкл</label>
+              <span class="control-box${{s.daily_budget_is_default ? ' default-budget' : ''}}" title="${{escapeHtml(budgetTitle)}}"><span>₽/день</span><input class="budget" type="number" min="0" step="100" value="${{budgetValue}}"><span class="calc-chip" data-avg-orders="${{avgOrders}}">${{escapeHtml(budgetPct)}}</span></span>
+              ${{swipeToggleHtml('row-autopause', s.auto_pause, 'автовыкл', 'Автовыключение по дневному бюджету')}}
             </div>
           </td>
           <td>
             <div class="row-controls">
               <span class="control-box"><span>Пауза</span><input class="pause-input" value="${{escapeHtml(s.pause_interval || '23-08')}}"></span>
-              <label class="switch"><input class="row-schedule-auto" type="checkbox"${{s.schedule_auto ? ' checked' : ''}}>авто</label>
-              <button class="save-row" type="button">OK</button>
+              ${{swipeToggleHtml('row-schedule-auto', s.schedule_auto, 'авто', 'Автоматическая пауза по расписанию')}}
             </div>
           </td>
           <td class="num">${{fmt(s.today_spend, 0)}} / ${{fmt(s.daily_budget, 0)}}<div class="meta">${{s.last_spend_sync_at ? escapeHtml(String(s.last_spend_sync_at).slice(11,16)) : ''}}</div></td>
@@ -12026,8 +12518,7 @@ async function loadCampaigns(refreshDetails=false) {{
   const days = 30;
   const df = document.getElementById('df').value;
   const dt = document.getElementById('dt').value;
-  const showAll = showAllCampaignsEl && showAllCampaignsEl.checked ? '&show_all=1' : '';
-  const data = await fetch(`/api/ads/campaigns?nmid=${{encodeURIComponent(selectedArticle.nmid)}}&days=${{days}}&date_from=${{encodeURIComponent(df)}}&date_to=${{encodeURIComponent(dt)}}${{refreshDetails ? '&refresh=1' : ''}}${{showAll}}`).then(r => r.json());
+  const data = await fetch(`/api/ads/campaigns?nmid=${{encodeURIComponent(selectedArticle.nmid)}}&days=${{days}}&date_from=${{encodeURIComponent(df)}}&date_to=${{encodeURIComponent(dt)}}${{refreshDetails ? '&refresh=1' : ''}}`).then(r => r.json());
   renderCampaigns(data);
 }}
 async function saveCampaignRow(row) {{
@@ -12036,9 +12527,9 @@ async function saveCampaignRow(row) {{
   const campaign = campaigns.find(item => String(item.advert_id) === String(advertId)) || {{}};
   const payload = {{
     advert_id: advertId,
-    enabled: row.querySelector('.row-schedule-auto').checked,
+    enabled: swipeToggleValue(row, '.row-schedule-auto'),
     daily_budget: row.querySelector('.budget').value,
-    auto_pause: row.querySelector('.row-autopause').checked,
+    auto_pause: swipeToggleValue(row, '.row-autopause'),
     pause_interval: row.querySelector('.pause-input').value,
     nmid: selectedArticle.nmid,
     article: selectedArticle.article,
@@ -12065,10 +12556,45 @@ async function saveCampaignRow(row) {{
   }}
   loadAdLog();
 }}
-campaignsEl.addEventListener('click', event => {{
-  const btn = event.target.closest('.save-row');
-  if (!btn) return;
-  saveCampaignRow(btn.closest('tr'));
+campaignsEl.addEventListener('input', event => {{
+  const input = event.target.closest('.budget');
+  if (!input) return;
+  syncBudgetPct(input.closest('tr'));
+}});
+campaignsEl.addEventListener('change', event => {{
+  const input = event.target.closest('.budget,.pause-input');
+  if (!input) return;
+  saveCampaignRow(input.closest('tr'));
+}});
+campaignsEl.addEventListener('pointerdown', event => {{
+  const toggle = event.target.closest('.swipe-toggle');
+  if (!toggle) return;
+  event.preventDefault();
+  toggle.dataset.dragStartX = String(event.clientX);
+  toggle.dataset.dragging = '1';
+  try {{ toggle.setPointerCapture(event.pointerId); }} catch (err) {{}}
+}});
+campaignsEl.addEventListener('pointerup', event => {{
+  const toggle = event.target.closest('.swipe-toggle');
+  if (!toggle || toggle.dataset.dragging !== '1') return;
+  event.preventDefault();
+  const startX = Number(toggle.dataset.dragStartX || event.clientX);
+  const dx = event.clientX - startX;
+  delete toggle.dataset.dragStartX;
+  delete toggle.dataset.dragging;
+  try {{ toggle.releasePointerCapture(event.pointerId); }} catch (err) {{}}
+  if (Math.abs(dx) < 22) return;
+  const next = dx > 0;
+  if (next === (toggle.dataset.checked === '1')) return;
+  setSwipeToggle(toggle, next);
+  toggle.classList.add('is-saving');
+  saveCampaignRow(toggle.closest('tr')).finally(() => toggle.classList.remove('is-saving'));
+}});
+campaignsEl.addEventListener('pointercancel', event => {{
+  const toggle = event.target.closest('.swipe-toggle');
+  if (!toggle) return;
+  delete toggle.dataset.dragStartX;
+  delete toggle.dataset.dragging;
 }});
 document.getElementById('run').addEventListener('click', async () => {{
   setStatus('Проверяю...');
@@ -12083,7 +12609,6 @@ document.getElementById('refresh').addEventListener('click', () => {{
   loadCampaigns(true);
 }});
 document.getElementById('reload-log').addEventListener('click', loadAdLog);
-showAllCampaignsEl.addEventListener('change', () => loadCampaigns());
 q.addEventListener('input', () => {{ clearTimeout(window.__adSearch); window.__adSearch = setTimeout(() => renderArticles(allArticleItems), 180); }});
 for (const id of ['df','dt']) {{
   document.getElementById(id).addEventListener('change', () => {{
@@ -12308,10 +12833,11 @@ def _sync_panel_html(cabinet: dict | None, marketplace: str) -> str:
     return (
         '<div class="sync-card ozon">'
         '<h2>OZON</h2>'
-        '<p>Полный обмен Ozon с рекламными расходами или быстрый ограниченный режим без рекламы.</p>'
+        '<p>Полный обмен Ozon, быстрый режим без рекламы или отдельная загрузка рекламных расходов.</p>'
         '<div class="load-grid">'
         '<button type="button" class="primary" data-ozon-sync="full">Загрузить всё OZON</button>'
         '<button type="button" class="secondary" data-ozon-sync="fast">OZON без рекламы</button>'
+        '<button type="button" class="secondary" data-ozon-sync="ads">Реклама</button>'
         '</div>'
         '</div>'
     )
@@ -12470,6 +12996,7 @@ HTML = """\
   .sync-card.ozon .primary:hover:not(:disabled) {{ background:#ea580c; }}
   .sync-card.ozon .secondary {{ background:#6b7280; }}
   .sync-card.ozon .secondary:hover:not(:disabled) {{ background:#4b5563; }}
+  .sync-card.ozon .load-grid {{ grid-template-columns: repeat(3, minmax(0, 1fr)); }}
   .sync-card.disabled {{ background:#f3f4f6; border-style:dashed; }}
   .sync-card.disabled h2 {{ color:#6b7280; }}
   .sync-card.disabled .missing {{ margin-top:8px; padding:8px 10px; border-radius:7px; background:#fff7ed; color:#9a3412; font-weight:700; font-size:.82rem; }}
@@ -12732,10 +13259,12 @@ async function uploadFunnel(force = false) {{
   }}
 }}
 
-async function startOzonSync(withAds) {{
+async function startOzonSync(mode) {{
   const df = dfEl.value;
   const dt = dtEl.value;
-  const activeButton = ozonButtons.find(button => (button.dataset.ozonSync === 'full') === withAds);
+  const activeButton = ozonButtons.find(button => button.dataset.ozonSync === mode);
+  const withAds = mode === 'full';
+  const adsOnly = mode === 'ads';
   syncButtons.forEach(button => button.disabled = true);
   const oldText = activeButton ? activeButton.textContent : '';
   if (activeButton) activeButton.textContent = '⏳ Загружаю...';
@@ -12744,10 +13273,10 @@ async function startOzonSync(withAds) {{
   statusEl.className = 'status';
   logWrap.style.display = 'block';
   appendLog(`OZON: запрос отправлен ${{df}}..${{dt}}`);
-  appendLog(withAds ? 'Режим: полный синк с рекламой.' : 'Режим: быстрый синк без рекламы.');
+  appendLog(adsOnly ? 'Режим: только реклама.' : withAds ? 'Режим: полный синк с рекламой.' : 'Режим: быстрый синк без рекламы.');
   statusEl.textContent = 'Выполняется...';
 
-  const url = `/ozon/stream?date_from=${{df}}&date_to=${{dt}}&skip_ads=${{withAds ? '0' : '1'}}`;
+  const url = `/ozon/stream?date_from=${{df}}&date_to=${{dt}}&mode=${{encodeURIComponent(mode)}}&skip_ads=${{withAds || adsOnly ? '0' : '1'}}`;
   const resp = await fetch(url);
   if (!resp.ok || !resp.body) {{
     statusEl.textContent = `❌ Не удалось открыть поток логов (HTTP ${{resp.status}})`;
@@ -12792,7 +13321,7 @@ for (const button of loadButtons) {{
   button.addEventListener('click', () => startLoad(button));
 }}
 for (const button of ozonButtons) {{
-  button.addEventListener('click', () => startOzonSync(button.dataset.ozonSync === 'full'));
+  button.addEventListener('click', () => startOzonSync(button.dataset.ozonSync || 'fast'));
 }}
 if (funnelUploadBtn) funnelUploadBtn.addEventListener('click', () => uploadFunnel(false));
 if (funnelForceBtn) funnelForceBtn.addEventListener('click', () => uploadFunnel(true));
@@ -12919,7 +13448,8 @@ BUYOUT_ORDER_DAY_HTML = """\
     .article-table tbody tr:hover {{ background: #f0fdfa; }}
     .article-table tbody tr.selected {{ background: #ccfbf1; font-weight: 800; color: #115e59; }}
     .article-link {{ color: var(--accent); text-decoration: none; font-weight: 800; margin-left: 4px; }}
-    .article-link:hover {{ text-decoration: underline; }}
+    .campaigns-list-link {{ color: #7c3aed; text-decoration: none; font-weight: 900; margin-left: 4px; }}
+    .article-link:hover, .campaigns-list-link:hover {{ text-decoration: underline; }}
     .article-copy {{ background:none;border:none;cursor:pointer;padding:0 1px;margin-left:3px;
                      font-size:.8em;color:#94a3b8;opacity:.7;line-height:1;vertical-align:middle; }}
     .article-copy:hover {{ color:var(--accent);opacity:1; }}
@@ -13456,6 +13986,12 @@ function renderChart(data) {{
 
 function cellColorStyle(kind, prevRaw, currRaw, row) {{
   if (prevRaw === null || prevRaw === undefined || currRaw === null || currRaw === undefined) return '';
+  if (kind === 'stock') {{
+    const diff = currRaw - prevRaw;
+    const absThreshold = Number(row?.color_threshold ?? 20);
+    if (diff < absThreshold) return '';
+    return 'background:#dcfce7;color:#047857;font-weight:900;box-shadow:inset 0 0 0 1px #86efac';
+  }}
   if (String(row?.metric || '') === 'СПП') {{
     const diff = currRaw - prevRaw;
     const threshold = Number(row?.color_threshold ?? 1);
@@ -13640,10 +14176,13 @@ function renderArticles(articles) {{
           const wbLink = /^\d+$/.test(nmid)
             ? `<a class="article-link" href="https://www.wildberries.ru/catalog/${{nmid}}/detail.aspx" target="_blank" rel="noopener noreferrer" title="Открыть товар на WB" data-skip-select="1">↗</a>`
             : '';
+          const campaignsListLink = /^\d+$/.test(nmid)
+            ? `<a class="campaigns-list-link" href="https://cmp.wildberries.ru/campaigns/list?search=${{nmid}}" target="_blank" rel="noopener noreferrer" title="Рекламные кампании WB" data-skip-select="1">р</a>`
+            : '';
           const pct = item.drr != null ? item.drr.toFixed(1) + '%' : '—';
           const turnoverStr = (item.turnover != null ? item.turnover : 999) + 'д';
 	          return `<tr class="article-item${{selected}}" data-article="${{safeArticle}}" data-key="${{escapeHtml(itemKey)}}" title="${{safeArticle}}">
-	            <td>${{safeArticle}}${{copyBtn}}${{wbLink}}</td>
+	            <td>${{safeArticle}}${{copyBtn}}${{wbLink}}${{campaignsListLink}}</td>
             <td>${{formatCompactNumber(item.stock)}}</td>
             <td class="drr-cell">${{pct}}</td>
             <td>${{turnoverStr}}</td>
@@ -14983,6 +15522,7 @@ document.getElementById('export-xls').addEventListener('click', () => {{
     const profitPct   = revenue > 0 ? netProfit / revenue * 100 : 0;
     return {{
       article:           row.article,
+      nmid:              row.nmid,
       subject:           row.subject,
       strategy:          (row.labels||[]).join(", "),
       revenue_cat:       row.revenue_category,
@@ -16846,6 +17386,566 @@ def _render_db_page(selected_table: str | None, page: int, page_size: int, cabin
 </html>"""
     return _inject_brand(html, cabinet=cabinet).encode("utf-8")
 
+
+# ── Цены конкурентов — функции данных ─────────────────────────────────────
+
+def _fetch_competitor_prices_summary(cabinet_id: str) -> dict:
+    """Список наших артикулов с агрегатом цен конкурентов за последние 7 дней."""
+    import os as _os
+    if not _os.path.exists(PRICES_DB_PATH):
+        return {"rows": []}
+    try:
+        pconn = sqlite3.connect(PRICES_DB_PATH)
+        pconn.row_factory = sqlite3.Row
+        rows = pconn.execute("""
+            SELECT
+                cp.our_nm_id,
+                cp.our_name,
+                ph.price        AS our_price,
+                ph.stock        AS our_stock,
+                COUNT(DISTINCT cp.comp_nm_id)          AS competitors_count,
+                CAST(AVG(cprice.price) AS INTEGER)     AS median_price,
+                MIN(cprice.price)                      AS min_price,
+                MAX(cprice.price)                      AS max_price
+            FROM competitor_products cp
+            LEFT JOIN competitor_prices cprice
+                ON cprice.cabinet_id = cp.cabinet_id
+               AND cprice.our_nm_id  = cp.our_nm_id
+               AND cprice.comp_nm_id = cp.comp_nm_id
+               AND cprice.date >= date('now', '-7 days')
+               AND cprice.price > 0
+            LEFT JOIN (
+                SELECT nm_id, price, stock
+                FROM price_history
+                WHERE cabinet_id = ? AND date = (
+                    SELECT MAX(date) FROM price_history WHERE cabinet_id = ?
+                )
+            ) ph ON ph.nm_id = cp.our_nm_id
+            WHERE cp.cabinet_id = ?
+            GROUP BY cp.our_nm_id
+            ORDER BY cp.our_nm_id
+        """, (cabinet_id, cabinet_id, cabinet_id)).fetchall()
+        pconn.close()
+        return {"rows": [dict(r) for r in rows]}
+    except Exception as e:
+        return {"rows": [], "error": str(e)}
+
+
+def _fetch_competitor_costs(cabinet_id: str) -> dict:
+    """Возвращает % расходов WB и себестоимость по каждому артикулу + дефолты по кабинету."""
+    import os as _os
+    db_path = _os.path.join("data", "cabs", f"{cabinet_id}.db")
+    if not _os.path.exists(db_path):
+        return {"articles": {}, "defaults": {"commission_pct": 15.0, "logistics_pct": 8.0, "acquiring_pct": 2.0}}
+    try:
+        import sqlite3 as _sq
+        conn = _sq.connect(db_path)
+
+        # Дефолты по кабинету
+        drow = conn.execute('''
+            SELECT AVG("% комиссии WB"), AVG("% логистики"), AVG("% эквайринга")
+            FROM finance_article_day_detail
+            WHERE "Дата" >= date("now","-30 days") AND "% комиссии WB" > 0
+        ''').fetchone()
+        defaults = {
+            "commission_pct": round(drow[0] or 15.0, 2),
+            "logistics_pct":  round(drow[1] or 0.0,  2),
+            "acquiring_pct":  round(drow[2] or 2.0,  2),
+        }
+
+        # По артикулу через raw_orders (vendor_code -> nm_id)
+        rows = conn.execute('''
+            SELECT
+                CAST(ro.nmId AS INTEGER)    AS nm_id,
+                AVG(f."% комиссии WB")      AS commission_pct,
+                AVG(f."% логистики")        AS logistics_pct,
+                AVG(f."% эквайринга")       AS acquiring_pct,
+                s.себестоимость             AS cost_price
+            FROM finance_article_day_detail f
+            JOIN (SELECT DISTINCT nmId, supplierArticle FROM raw_orders WHERE nmId IS NOT NULL) ro
+                ON ro.supplierArticle = f."Артикул"
+            LEFT JOIN SKU s ON s."Артикул поставщика" = f."Артикул"
+            WHERE f."Дата" >= date("now","-30 days")
+              AND f."% комиссии WB" > 0
+            GROUP BY ro.nmId
+        ''').fetchall()
+        conn.close()
+
+        articles = {}
+        for nm_id, comm, log, acq, cost in rows:
+            if not nm_id:
+                continue
+            articles[str(nm_id)] = {
+                "commission_pct": round(comm or defaults["commission_pct"], 2),
+                "logistics_pct":  round(log  or defaults["logistics_pct"],  2),
+                "acquiring_pct":  round(acq  or defaults["acquiring_pct"],  2),
+                "cost_price":     float(cost) if cost else None,
+            }
+        return {"articles": articles, "defaults": defaults}
+    except Exception as e:
+        return {"articles": {}, "defaults": {"commission_pct": 15.0, "logistics_pct": 8.0, "acquiring_pct": 2.0}, "error": str(e)}
+
+
+def _fetch_live_prices(nm_ids: list) -> dict:
+    """Запрашивает живые цены у агента на ноуте."""
+    import urllib.request as _ur
+    import urllib.error as _ue
+    agent_url = "http://100.65.13.99:8100"
+    nm_str = ";".join(str(n) for n in nm_ids)
+    try:
+        raw = _ur.urlopen(f"{agent_url}/prices?nm={nm_str}", timeout=30).read()
+        import json as _json
+        data = _json.loads(raw)
+        return {str(p["id"]): p for p in data.get("products", [])}
+    except _ue.URLError:
+        return {"_error": "agent_unavailable"}
+    except Exception as e:
+        return {"_error": str(e)}
+
+
+def _fetch_competitor_prices_detail(cabinet_id: str, nm_id: int) -> dict:
+    """Список конкурентов с последними ценами для выбранного артикула."""
+    import os as _os
+    if not _os.path.exists(PRICES_DB_PATH):
+        return {"rows": []}
+    try:
+        pconn = sqlite3.connect(PRICES_DB_PATH)
+        pconn.row_factory = sqlite3.Row
+        rows = pconn.execute("""
+            SELECT
+                cp.comp_nm_id,
+                cp.comp_name,
+                cp.comp_brand,
+                cp.comp_seller,
+                cp.url,
+                cp.subject_name,
+                cprice.price,
+                cprice.price_basic,
+                cprice.stock,
+                cprice.rating,
+                cprice.feedbacks,
+                cprice.date AS last_date
+            FROM competitor_products cp
+            LEFT JOIN competitor_prices cprice
+                ON cprice.cabinet_id = cp.cabinet_id
+               AND cprice.our_nm_id  = cp.our_nm_id
+               AND cprice.comp_nm_id = cp.comp_nm_id
+               AND cprice.date = (
+                    SELECT MAX(date) FROM competitor_prices
+                    WHERE cabinet_id = cp.cabinet_id
+                      AND our_nm_id  = cp.our_nm_id
+                      AND comp_nm_id = cp.comp_nm_id
+               )
+            WHERE cp.cabinet_id = ? AND cp.our_nm_id = ?
+            ORDER BY COALESCE(cprice.price, 999999)
+        """, (cabinet_id, nm_id)).fetchall()
+        pconn.close()
+        return {"rows": [dict(r) for r in rows]}
+    except Exception as e:
+        return {"rows": [], "error": str(e)}
+
+
+COMPETITOR_PRICES_HTML = """\
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>Цены конкурентов</title>
+<style>
+*{{box-sizing:border-box;margin:0;padding:0}}
+body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;font-size:13px;background:#f5f6fa;color:#1a1d23}}
+.top-bar{{background:#1a1d23;padding:10px 16px;display:flex;align-items:center;gap:16px}}
+.top-bar a{{color:#aaa;text-decoration:none;font-size:12px}}
+.top-bar a:hover,.top-bar a.active{{color:#fff}}
+.page{{padding:16px}}
+h2{{font-size:15px;font-weight:600;margin-bottom:12px;color:#1a1d23}}
+.section{{background:#fff;border-radius:8px;box-shadow:0 1px 4px rgba(0,0,0,.08);margin-bottom:16px;overflow:hidden}}
+.section-header{{padding:10px 16px;border-bottom:1px solid #eef;font-weight:600;font-size:13px;background:#fafbff;display:flex;align-items:center;gap:8px}}
+table{{width:100%;border-collapse:collapse}}
+th{{padding:8px 10px;text-align:left;font-size:11px;font-weight:600;color:#888;background:#fafbff;border-bottom:1px solid #eef;position:sticky;top:0;z-index:1}}
+td{{padding:7px 10px;border-bottom:1px solid #f2f3f7;vertical-align:middle}}
+tr.selected{{background:#eef3ff}}
+tr:hover{{background:#f7f9ff;cursor:pointer}}
+.price{{font-weight:600;color:#1a1d23}}
+.price-low{{color:#1a9e4a}}
+.price-high{{color:#d9312e}}
+.no-data{{color:#bbb;font-style:italic}}
+.badge{{display:inline-block;padding:2px 7px;border-radius:10px;font-size:11px;font-weight:600}}
+.badge-count{{background:#eef0ff;color:#5865f2}}
+.link-btn{{color:#5865f2;text-decoration:none;font-size:11px}}
+.link-btn:hover{{text-decoration:underline}}
+.spinner{{text-align:center;padding:32px;color:#aaa}}
+#detail-panel{{display:none}}
+#detail-panel.visible{{display:block}}
+.nm-label{{font-size:11px;color:#888;display:block}}
+.costs-block{{background:#fff;border:1px solid #e5e7eb;border-radius:8px;padding:10px 16px;margin-bottom:8px;display:flex;align-items:center;gap:20px;flex-wrap:wrap}}
+.costs-block b{{font-size:12px;color:#6b7280;margin-right:4px}}
+.costs-block label{{display:flex;align-items:center;gap:5px;font-size:12px;color:#374151}}
+.costs-block input{{width:62px;height:26px;padding:0 6px;border:1px solid #cbd5e1;border-radius:5px;font-size:12px;text-align:right}}
+.new-price-wrap{{display:flex;align-items:center;gap:2px}}
+.new-price-wrap input{{width:76px;height:24px;padding:0 5px;border:1px solid #cbd5e1;border-radius:4px;font-size:12px;text-align:right}}
+.new-price-wrap button{{width:22px;height:24px;border:1px solid #cbd5e1;background:#f8fafc;border-radius:4px;cursor:pointer;font-size:13px;line-height:1;padding:0}}
+.new-price-wrap button:hover{{background:#e0f2fe}}
+.our-margin,.new-margin{{white-space:nowrap}}
+.margin-warn{{color:#f59e0b;font-size:11px}}
+.econ-tbl{{border-collapse:collapse;font-size:11px;width:100%}}
+.econ-tbl th{{background:#f1f5f9;padding:3px 8px;font-weight:600;color:#64748b;white-space:nowrap;border:1px solid #e2e8f0;text-align:center}}
+.econ-tbl td{{padding:3px 8px;border:1px solid #e2e8f0;white-space:nowrap;text-align:right}}
+.econ-tbl .econ-lbl{{text-align:left;font-weight:600;color:#374151;background:#f8fafc}}
+.econ-tbl tr#econ-new td{{color:#166534}}
+</style>
+</head>
+<body>
+<div class="top-bar">{report_nav}</div>
+<div class="page">
+  <h2>Цены конкурентов — hld</h2>
+
+  <div class="costs-block" id="costs-block">
+    <b>Расходы по умолчанию:</b>
+    <label>Комиссия&nbsp;<input id="c-comm" type="number" step="0.1" min="0" max="100" value="15">%</label>
+    <label>Эквайринг&nbsp;<input id="c-acq" type="number" step="0.1" min="0" max="100" value="2">%</label>
+    <label>Логистика&nbsp;<input id="c-log" type="number" step="0.1" min="0" max="100" value="0">%</label>
+    <label>ДРР&nbsp;<input id="c-drr" type="number" step="0.1" min="0" max="100" value="0">%</label>
+    <label>Прочие&nbsp;<input id="c-other" type="number" step="0.1" min="0" max="100" value="0">%</label>
+    <span id="costs-status" style="font-size:11px;color:#9ca3af;margin-left:8px">загрузка…</span>
+  </div>
+
+  <div class="section">
+    <div class="section-header">
+      Наши артикулы
+      <span id="our-count" style="font-weight:400;color:#888;font-size:12px"></span>
+    </div>
+    <div style="overflow-x:auto">
+      <table id="our-table">
+        <thead>
+          <tr>
+            <th>nmId</th>
+            <th>Название</th>
+            <th>Тек цена</th>
+            <th>Маржа</th>
+            <th>Новая цена</th>
+            <th>Новая маржа</th>
+            <th>Остаток</th>
+            <th>Конкурентов</th>
+            <th>Медиана</th>
+            <th>Мин</th>
+            <th>Макс</th>
+            <th>Позиция</th>
+          </tr>
+        </thead>
+        <tbody id="our-tbody">
+          <tr><td colspan="9" class="spinner">Загрузка…</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="section" id="detail-panel">
+    <div class="section-header">
+      Конкуренты:&nbsp;
+      <span id="detail-title" style="font-weight:400"></span>
+      <span id="detail-count" style="font-weight:400;color:#888;font-size:12px;margin-left:8px"></span>
+    </div>
+    <div id="econ-block" style="overflow-x:auto;margin-bottom:6px">
+      <table class="econ-tbl">
+        <thead><tr>
+          <th></th><th>Цена</th><th>Комиссия</th><th>Логистика</th><th>Эквайринг</th><th>ДРР</th><th>Прочие</th><th>Себест.</th><th>Маржа</th>
+        </tr></thead>
+        <tbody>
+          <tr id="econ-cur"><td class="econ-lbl">Текущая</td><td colspan="8" style="color:#aaa">—</td></tr>
+          <tr id="econ-new" style="background:#f0fdf4"><td class="econ-lbl">Новая</td><td colspan="8" style="color:#aaa">—</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div style="overflow-x:auto">
+      <table>
+        <thead>
+          <tr>
+            <th>nmId</th>
+            <th>Название</th>
+            <th>Бренд</th>
+            <th>Продавец</th>
+            <th>Цена (БД)</th>
+            <th>До скидки</th>
+            <th>Остаток</th>
+            <th style="background:#e8f5e9;color:#2e7d32">Живая цена</th>
+            <th style="background:#e8f5e9;color:#2e7d32">Живой склад</th>
+            <th>★</th>
+            <th>Отзывы</th>
+            <th>Дата</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody id="detail-tbody"></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+<script>
+const CAB = '{cabinet_id}';
+function fmt(n){{if(!n&&n!==0)return'<span class="no-data">—</span>';return Number(n).toLocaleString('ru-RU')+' ₽';}}
+function fmtN(n){{if(!n&&n!==0)return'<span class="no-data">—</span>';return Number(n).toLocaleString('ru-RU');}}
+function posLabel(our,med){{
+  if(!our||!med)return'<span class="no-data">—</span>';
+  const pct=((our-med)/med*100).toFixed(1);
+  const cls=our<=med?'price-low':'price-high';
+  return`<span class="${{cls}}">${{pct>0?'+':''}}${{pct}}%</span>`;
+}}
+
+// ── Расходы и маржа ──────────────────────────────────────────────────────
+let costsData = {{articles:{{}}, defaults:{{commission_pct:15,logistics_pct:0,acquiring_pct:2}}}};
+
+function getInputs(){{
+  return {{
+    comm:  parseFloat(document.getElementById('c-comm').value)  || 0,
+    acq:   parseFloat(document.getElementById('c-acq').value)   || 0,
+    log:   parseFloat(document.getElementById('c-log').value)   || 0,
+    drr:   parseFloat(document.getElementById('c-drr').value)   || 0,
+    other: parseFloat(document.getElementById('c-other').value) || 0,
+  }};
+}}
+
+function calcMargin(price, costPrice, hasCost, {{comm,acq,log,drr,other}}){{
+  if(!price) return null;
+  const feesRub = price * (comm + acq + log + drr + other) / 100;
+  const profit  = price - feesRub - (hasCost ? (costPrice||0) : 0);
+  return profit / price * 100;
+}}
+
+function fmtMargin(m, hasCost){{
+  if(m==null) return '<span class="no-data">—</span>';
+  const warn = hasCost ? '' : '<span class="margin-warn" title="нет себестоимости">⚠</span>&nbsp;';
+  const cls  = m>=20 ? 'price-low' : m>=10 ? '' : 'price-high';
+  return warn+'<span class="'+cls+'">'+m.toFixed(1)+'%</span>';
+}}
+
+function recalcRow(tr, inputs){{
+  const nm       = tr.dataset.nm;
+  const price    = +tr.dataset.price || 0;
+  const art      = costsData.articles[nm] || {{}};
+  const rowInputs = {{
+    comm:  art.commission_pct ?? inputs.comm,
+    acq:   art.acquiring_pct  ?? inputs.acq,
+    log:   art.logistics_pct  ?? inputs.log,
+    drr:   inputs.drr,
+    other: inputs.other,
+  }};
+  const costPrice = art.cost_price ?? null;
+  const hasCost   = costPrice != null && costPrice > 0;
+  const mCell = tr.querySelector('.our-margin');
+  if(mCell) mCell.innerHTML = fmtMargin(calcMargin(price,costPrice,hasCost,rowInputs), hasCost);
+  const inp = tr.querySelector('.new-price-input');
+  const nmCell = tr.querySelector('.new-margin');
+  if(inp && nmCell) nmCell.innerHTML = fmtMargin(calcMargin(+inp.value,costPrice,hasCost,rowInputs), hasCost);
+}}
+
+function recalcAllMargins(){{
+  const inputs = getInputs();
+  document.querySelectorAll('#our-tbody tr[data-nm]').forEach(tr=>recalcRow(tr,inputs));
+}}
+
+async function loadCosts(){{
+  try{{
+    const r = await fetch(`/api/competitor-prices/costs?cabinet_id=${{CAB}}`);
+    costsData = await r.json();
+    const d = costsData.defaults||{{}};
+    document.getElementById('c-comm').value  = (d.commission_pct||15).toFixed(1);
+    document.getElementById('c-acq').value   = (d.acquiring_pct ||2).toFixed(1);
+    document.getElementById('c-log').value   = (d.logistics_pct ||0).toFixed(1);
+    document.getElementById('costs-status').textContent = 'данные по кабинету загружены';
+    recalcAllMargins();
+  }}catch(e){{
+    document.getElementById('costs-status').textContent = 'ошибка загрузки расходов';
+  }}
+}}
+
+['c-comm','c-acq','c-log','c-drr','c-other'].forEach(id=>{{
+  document.getElementById(id).addEventListener('input', recalcAllMargins);
+}});
+
+async function loadSummary(){{
+  const resp=await fetch(`/api/competitor-prices/summary?cabinet_id=${{CAB}}`);
+  const data=await resp.json();
+  const rows=data.rows||[];
+  document.getElementById('our-count').textContent=`(${{rows.length}} арт.)`;
+  const tbody=document.getElementById('our-tbody');
+  if(!rows.length){{
+    tbody.innerHTML='<tr><td colspan="13" style="padding:24px;text-align:center;color:#aaa">Нет данных. Запустите wb_competitor_finder.py и wb_price_monitor.py</td></tr>';
+    return;
+  }}
+  tbody.innerHTML=rows.map(r=>`
+    <tr data-nm="${{r.our_nm_id}}" data-price="${{r.our_price||0}}" data-name="${{(r.our_name||'').replace(/"/g,'&quot;').replace(/'/g,'&#39;')}}" onclick="if(!event.target.closest('.new-price-wrap'))selectRow(this)">
+      <td><b>${{r.our_nm_id}}</b></td>
+      <td style="max-width:240px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${{r.our_name||'—'}}</td>
+      <td class="price">${{fmt(r.our_price)}}</td>
+      <td class="our-margin" style="white-space:nowrap"><span class="no-data">…</span></td>
+      <td>
+        <div class="new-price-wrap" onclick="event.stopPropagation()">
+          <button onclick="adjustPrice(this.closest('tr'),-100)">↓</button>
+          <input class="new-price-input" type="number" value="${{r.our_price||0}}" min="0" step="100" oninput="onNewPriceInput(this.closest('tr'))">
+          <button onclick="adjustPrice(this.closest('tr'),100)">↑</button>
+        </div>
+      </td>
+      <td class="new-margin" style="white-space:nowrap"><span class="no-data">…</span></td>
+      <td>${{fmtN(r.our_stock)}}</td>
+      <td><span class="badge badge-count">${{r.competitors_count||0}}</span></td>
+      <td>${{fmt(r.median_price)}}</td>
+      <td class="price-low">${{fmt(r.min_price)}}</td>
+      <td class="price-high">${{fmt(r.max_price)}}</td>
+      <td>${{posLabel(r.our_price,r.median_price)}}</td>
+    </tr>`).join('');
+  loadCosts();
+}}
+
+function adjustPrice(tr, delta){{
+  const inp = tr.querySelector('.new-price-input');
+  if(!inp) return;
+  const newVal = Math.max(0, (+inp.value||0) + delta);
+  inp.value = newVal;
+  onNewPriceInput(tr);
+}}
+
+function onNewPriceInput(tr){{
+  const inputs = getInputs();
+  const nm       = tr.dataset.nm;
+  const art      = costsData.articles[nm] || {{}};
+  const rowInputs = {{
+    comm:  art.commission_pct ?? inputs.comm,
+    acq:   art.acquiring_pct  ?? inputs.acq,
+    log:   art.logistics_pct  ?? inputs.log,
+    drr:   inputs.drr,
+    other: inputs.other,
+  }};
+  const costPrice = art.cost_price ?? null;
+  const hasCost   = costPrice != null && costPrice > 0;
+  const inp = tr.querySelector('.new-price-input');
+  const cell = tr.querySelector('.new-margin');
+  if(cell) cell.innerHTML = fmtMargin(calcMargin(+inp.value,costPrice,hasCost,rowInputs), hasCost);
+  // Обновляем блок экономики если эта строка выбрана
+  if(tr.classList.contains('selected')) fillEconRow('econ-new', +inp.value, art, rowInputs);
+}}
+
+function econCell(price, pct, isRub){{
+  if(!price) return '<td>—</td>';
+  if(isRub) return `<td>${{Math.round(price).toLocaleString('ru-RU')}} ₽</td>`;
+  const rub = Math.round(price * pct / 100);
+  return `<td>${{rub.toLocaleString('ru-RU')}} ₽<br><span style="color:#9ca3af">${{pct.toFixed(1)}}%</span></td>`;
+}}
+
+function fillEconRow(rowId, price, art, rowInputs){{
+  const {{comm,acq,log,drr,other}} = rowInputs;
+  const costPrice = art.cost_price ?? null;
+  const hasCost   = costPrice != null && costPrice > 0;
+  const m = calcMargin(price, costPrice, hasCost, rowInputs);
+  const mStr = m==null ? '—' : (hasCost?'':'<span style="color:#f59e0b">⚠</span> ')+'<b>'+(m>=0?'':'')+ m.toFixed(1)+'%</b>';
+  const mStyle = m==null?'' : m>=20?'color:#16a34a' : m>=10?'' : 'color:#dc2626';
+  const row = document.getElementById(rowId);
+  if(!row) return;
+  row.innerHTML = `
+    <td class="econ-lbl">${{row.id==='econ-cur'?'Текущая':'Новая'}}</td>
+    <td><b>${{price.toLocaleString('ru-RU')}} ₽</b></td>
+    ${{econCell(price,comm)}}
+    ${{econCell(price,log)}}
+    ${{econCell(price,acq)}}
+    ${{econCell(price,drr)}}
+    ${{econCell(price,other)}}
+    <td>${{hasCost ? Math.round(costPrice).toLocaleString('ru-RU')+' ₽' : '<span style="color:#f59e0b">нет</span>'}}</td>
+    <td style="${{mStyle}}">${{mStr}}</td>
+  `;
+}}
+
+function updateEconBlock(nmId, selectedTr){{
+  const art      = costsData.articles[nmId] || {{}};
+  const inputs   = getInputs();
+  const rowInputs = {{
+    comm:  art.commission_pct ?? inputs.comm,
+    acq:   art.acquiring_pct  ?? inputs.acq,
+    log:   art.logistics_pct  ?? inputs.log,
+    drr:   inputs.drr,
+    other: inputs.other,
+  }};
+  const curPrice = +selectedTr.dataset.price || 0;
+  const inp = selectedTr.querySelector('.new-price-input');
+  const newPrice = inp ? +inp.value : curPrice;
+  fillEconRow('econ-cur', curPrice, art, rowInputs);
+  fillEconRow('econ-new', newPrice, art, rowInputs);
+}}
+async function selectRow(el){{
+  const nmId=el.dataset.nm;
+  const name=el.dataset.name||'';
+  document.querySelectorAll('#our-tbody tr.selected').forEach(r=>r.classList.remove('selected'));
+  el.classList.add('selected');
+  document.getElementById('detail-title').textContent=name;
+  const panel=document.getElementById('detail-panel');
+  panel.classList.add('visible');
+  updateEconBlock(nmId, el);
+  document.getElementById('detail-tbody').innerHTML='<tr><td colspan="11" class="spinner">Загрузка…</td></tr>';
+  const resp=await fetch(`/api/competitor-prices/detail?cabinet_id=${{CAB}}&nm_id=${{nmId}}`);
+  const data=await resp.json();
+  const rows=data.rows||[];
+  document.getElementById('detail-count').textContent=`(${{rows.length}} конкурентов)`;
+  if(!rows.length){{
+    document.getElementById('detail-tbody').innerHTML='<tr><td colspan="11" style="padding:16px;color:#aaa">Нет данных</td></tr>';
+    return;
+  }}
+  const uniqueNms=[...new Set(rows.map(r=>r.comp_nm_id))];
+  document.getElementById('detail-tbody').innerHTML=rows.map(r=>`
+    <tr data-comp-nm="${{r.comp_nm_id}}">
+      <td><small>${{r.comp_nm_id}}</small></td>
+      <td style="max-width:260px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="${{(r.comp_name||'').replace(/"/g,'&quot;')}}">${{r.comp_name||'—'}}</td>
+      <td>${{r.comp_brand||'—'}}</td>
+      <td style="max-width:160px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${{r.comp_seller||'—'}}</td>
+      <td class="price">${{fmt(r.price)}}</td>
+      <td style="color:#888">${{fmt(r.price_basic)}}</td>
+      <td>${{fmtN(r.stock)}}</td>
+      <td class="live-price" style="background:#f1f8e9;color:#aaa;font-size:11px">…</td>
+      <td class="live-stock" style="background:#f1f8e9;color:#aaa;font-size:11px">…</td>
+      <td>${{r.rating||'—'}}</td>
+      <td>${{fmtN(r.feedbacks)}}</td>
+      <td style="color:#aaa;font-size:11px">${{r.last_date||'—'}}</td>
+      <td><a class="link-btn" href="${{r.url}}" target="_blank">WB ↗</a></td>
+    </tr>`).join('');
+  // Подгружаем живые цены батчами по 20
+  loadLivePrices(uniqueNms);
+}}
+async function loadLivePrices(nmIds){{
+  const BATCH=20;
+  for(let i=0;i<nmIds.length;i+=BATCH){{
+    const batch=nmIds.slice(i,i+BATCH);
+    try{{
+      const r=await fetch(`/api/competitor-prices/live-prices?nm=${{batch.join(';')}}`);
+      const live=await r.json();
+      if(live._error){{
+        if(i===0) document.querySelectorAll('#detail-tbody .live-price').forEach(td=>{{td.textContent='нет агента';td.style.color='#e57373';}});
+        break;
+      }}
+      batch.forEach(nm=>{{
+        const p=live[String(nm)];
+        document.querySelectorAll(`#detail-tbody tr[data-comp-nm="${{nm}}"]`).forEach(tr=>{{
+          const lp=tr.querySelector('.live-price');
+          const ls=tr.querySelector('.live-stock');
+          if(p){{
+            lp.innerHTML=`<b style="color:#2e7d32">${{p.price?p.price.toLocaleString('ru-RU')+' ₽':'—'}}</b>`;
+            ls.innerHTML=`<span style="color:#1565c0">${{p.stock??'—'}}</span>`;
+          }} else {{
+            lp.textContent='—'; ls.textContent='—';
+          }}
+          lp.style.fontSize=''; ls.style.fontSize='';
+        }});
+      }});
+    }}catch(e){{
+      console.warn('live-prices error',e);
+      break;
+    }}
+  }}
+}}
+loadSummary();
+</script>
+</body>
+</html>
+"""
+
+
 COMMENTS_HTML = """\
 <!doctype html>
 <html lang="ru">
@@ -18474,6 +19574,14 @@ legend{{color:#94a3b8;padding:0 8px;}}</style></head>
             ), cabinet=cabinet).encode("utf-8")
             self._send_html(body)
 
+        elif parsed.path == "/analytics/competitor-prices":
+            cab_id = (cabinet or {}).get("cabinet_id", "hld")
+            body = COMPETITOR_PRICES_HTML.format(
+                report_nav=_report_nav_html_for_cabinet(cabinet),
+                cabinet_id=cab_id,
+            ).encode("utf-8")
+            self._send_html(body)
+
         elif parsed.path == "/ads/bidder":
             if not _has_wb_cabinet(cabinet):
                 self._send_redirect("/")
@@ -18569,7 +19677,7 @@ legend{{color:#94a3b8;padding:0 8px;}}</style></head>
             dates, effective_from, effective_to = _date_range_limited(
               date_from,
               date_to,
-              max_days=93 if granularity == "week" else 30,
+              max_days=93 if granularity == "week" else 45,
             )
             with _db_connect() as conn:
               if not _table_exists(conn, "buyout_order_day"):
@@ -18578,7 +19686,7 @@ legend{{color:#94a3b8;padding:0 8px;}}</style></head>
                   "rows": [],
                   "effective_from": effective_from,
                   "effective_to": effective_to,
-                  "max_days": 93 if granularity == "week" else 30,
+                  "max_days": 93 if granularity == "week" else 45,
                   "granularity": granularity,
                 })
                 return
@@ -18633,6 +19741,27 @@ legend{{color:#94a3b8;padding:0 8px;}}</style></head>
                 self._send_json({"error": "invalid planning parameters", "summary": {}, "rows": []}, status=400)
                 return
             self._send_json(payload)
+
+        elif parsed.path == "/api/competitor-prices/summary":
+            cab_id = (params.get("cabinet_id") or ["hld"])[0]
+            self._send_json(_fetch_competitor_prices_summary(cab_id))
+
+        elif parsed.path == "/api/competitor-prices/detail":
+            cab_id = (params.get("cabinet_id") or ["hld"])[0]
+            try:
+                nm_id = int((params.get("nm_id") or ["0"])[0])
+            except ValueError:
+                nm_id = 0
+            self._send_json(_fetch_competitor_prices_detail(cab_id, nm_id))
+
+        elif parsed.path == "/api/competitor-prices/live-prices":
+            nm_raw = (params.get("nm") or [""])[0]
+            nm_ids = [int(x) for x in nm_raw.replace(",", ";").split(";") if x.strip().isdigit()]
+            self._send_json(_fetch_live_prices(nm_ids))
+
+        elif parsed.path == "/api/competitor-prices/costs":
+            cab_id = (params.get("cabinet_id") or ["hld"])[0]
+            self._send_json(_fetch_competitor_costs(cab_id))
 
         elif parsed.path == "/api/analytics/comments-data":
             self._send_json(_fetch_comments_data())
@@ -18920,6 +20049,8 @@ legend{{color:#94a3b8;padding:0 8px;}}</style></head>
         elif parsed.path == "/ozon/stream":
             date_from = (params.get("date_from") or [""])[0]
             date_to = (params.get("date_to") or [""])[0]
+            mode = (params.get("mode") or [""])[0]
+            ads_only = mode == "ads" or (params.get("ads_only") or ["0"])[0] == "1"
             skip_ads = (params.get("skip_ads") or ["1"])[0] == "1"
 
             if not date_from or not date_to:
@@ -18939,7 +20070,7 @@ legend{{color:#94a3b8;padding:0 8px;}}</style></head>
             log_q_ozon: queue.Queue = queue.Queue()
             ozon_thread = threading.Thread(
                 target=run_ozon_sync,
-                args=(date_from, date_to, log_q_ozon, skip_ads, cabinet),
+                args=(date_from, date_to, log_q_ozon, skip_ads, cabinet, ads_only),
                 daemon=True,
             )
             ozon_thread.start()
@@ -18974,62 +20105,6 @@ legend{{color:#94a3b8;padding:0 8px;}}</style></head>
                     finished = True
 
             ozon_thread.join(timeout=5)
-
-        elif parsed.path == "/ozon/upload":
-            today = date.today()
-            month_ago = today - timedelta(days=29)
-            mp = (cabinet or {}).get("marketplace", "wb")
-            if mp not in ("ozon", "both"):
-                self._send_redirect("/")
-                return
-            ozon_page = f"""<!DOCTYPE html>
-<html lang="ru">
-<head><meta charset="utf-8"><title>OZON Синк</title>
-<style>
-*{{box-sizing:border-box;margin:0;padding:0;}}
-body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#f0f2f5;}}
-.card-wrap{{display:flex;justify-content:center;padding:40px 16px;}}
-.card{{background:#fff;border-radius:12px;padding:32px;box-shadow:0 2px 12px rgba(0,0,0,.08);width:100%;max-width:520px;}}
-h1{{font-size:1.4rem;font-weight:700;color:#1a1a2e;margin-bottom:24px;}}
-label{{display:block;font-size:.85rem;font-weight:600;color:#555;margin-bottom:6px;margin-top:16px;}}
-input[type=date]{{width:100%;padding:10px 12px;border:1.5px solid #d1d5db;border-radius:8px;font-size:1rem;}}
-.row{{display:flex;gap:16px;}}.row>div{{flex:1;}}
-button{{width:100%;margin-top:18px;padding:12px;background:#f97316;color:#fff;border:none;border-radius:8px;font-size:1rem;font-weight:600;cursor:pointer;}}
-button:hover{{background:#ea6c0c;}}
-button.secondary{{background:#6b7280;margin-top:8px;}}
-#log{{margin-top:20px;background:#0f172a;border-radius:8px;padding:14px;max-height:340px;overflow-y:auto;font-family:monospace;font-size:.78rem;color:#94a3b8;display:none;}}
-.log-done{{color:#4ade80;}}.log-error{{color:#f87171;}}
-</style></head>
-<body>
-<div class="card-wrap"><div class="card">
-<h1>OZON Синхронизация</h1>
-<div class="row">
-  <div><label>Дата с</label><input type="date" id="df" value="{month_ago.isoformat()}"></div>
-  <div><label>Дата по</label><input type="date" id="dt" value="{today.isoformat()}"></div>
-</div>
-<button onclick="startSync(false)">Загрузить (без рекламы, быстро)</button>
-<button class="secondary" onclick="startSync(true)">Полный синк с рекламой (медленно)</button>
-<div id="log"></div>
-</div></div>
-<script>
-function startSync(withAds){{
-  var df=document.getElementById('df').value,dt=document.getElementById('dt').value;
-  var log=document.getElementById('log');log.style.display='block';log.innerHTML='';
-  var url='/ozon/stream?date_from='+df+'&date_to='+dt+'&skip_ads='+(withAds?'0':'1');
-  var es=new EventSource(url);
-  es.onmessage=function(e){{
-    var d=JSON.parse(e.data),div=document.createElement('div');
-    div.textContent='['+d.type+'] '+d.text;
-    if(d.type==='done')div.className='log-done';
-    if(d.type==='error')div.className='log-error';
-    log.appendChild(div);log.scrollTop=log.scrollHeight;
-    if(d.type==='done'||d.type==='error')es.close();
-  }};
-}}
-</script>
-</body></html>"""
-            body = _inject_brand(ozon_page, cabinet=cabinet).encode("utf-8")
-            self._send_html(body)
 
         elif parsed.path == "/ozon/analytics/day":
             # Basic OZON daily summary table
@@ -19230,7 +20305,7 @@ load();
             dates, effective_from, effective_to = _date_range_limited(
               date_from,
               date_to,
-              max_days=93 if granularity == "week" else 30,
+              max_days=93 if granularity == "week" else 45,
             )
             with _db_connect() as conn:
               if not _table_exists(conn, "ozon_sku_day_analytics"):
@@ -19239,7 +20314,7 @@ load();
                   "rows": [],
                   "effective_from": effective_from,
                   "effective_to": effective_to,
-                  "max_days": 93 if granularity == "week" else 30,
+                  "max_days": 93 if granularity == "week" else 45,
                   "granularity": granularity,
                 })
                 return
@@ -19533,6 +20608,7 @@ load();
             # (header label, field key)
             col_defs = [
                 ("Артикул",        "article"),
+                ("nmid",           "nmid"),
                 ("Предмет",        "subject"),
                 ("Ярлыки",         "strategy"),
                 ("Категория",      "revenue_cat"),
@@ -19584,8 +20660,16 @@ load();
                 cell.fill = hdr_fill
                 cell.font = hdr_font
                 cell.alignment = hdr_align
+            nmid_col_idx = next((i for i, (_, f) in enumerate(col_defs) if f == "nmid"), None)
+            link_font = Font(color="0563C1", underline="single")
             for r in rows:
                 ws.append([r.get(f, "") for _, f in col_defs])
+                if nmid_col_idx is not None:
+                    nmid_val = r.get("nmid", "")
+                    if nmid_val:
+                        cell = ws.cell(row=ws.max_row, column=nmid_col_idx + 1)
+                        cell.hyperlink = f"https://www.wildberries.ru/catalog/{nmid_val}/detail.aspx"
+                        cell.font = link_font
             for col in ws.columns:
                 max_len = max((len(str(cell.value or "")) for cell in col), default=0)
                 ws.column_dimensions[col[0].column_letter].width = min(max_len + 2, 30)

@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
+import fcntl
 import os
 import sqlite3
 import subprocess
 import sys
+import threading
+import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -39,15 +43,17 @@ class Cabinet:
 class RunLog:
     def __init__(self, path: Path) -> None:
         self.path = path
+        self._lock = threading.Lock()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text("", encoding="utf-8")
 
     def write(self, message: str) -> None:
         stamp = datetime.now(ZoneInfo(TZ_NAME)).isoformat(timespec="seconds")
         line = f"[{stamp}] {message}"
-        print(line, flush=True)
-        with self.path.open("a", encoding="utf-8") as fh:
-            fh.write(line + "\n")
+        with self._lock:
+            print(line, flush=True)
+            with self.path.open("a", encoding="utf-8") as fh:
+                fh.write(line + "\n")
 
 
 def _today_msk() -> date:
@@ -431,7 +437,67 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cabinet", action="append", default=[], help="Run only this cabinet; can be repeated")
     parser.add_argument("--only", choices=("all", "wb", "ozon"), default="all")
     parser.add_argument("--validate-only", action="store_true")
+    parser.add_argument(
+        "--stagger-seconds",
+        type=float,
+        default=float(os.getenv("SYNC_CABINET_STAGGER_SECONDS", "2")),
+        help="Delay between starting independent cabinet jobs",
+    )
+    parser.add_argument(
+        "--max-workers",
+        type=int,
+        default=int(os.getenv("SYNC_MAX_CABINET_WORKERS", "0")),
+        help="Maximum parallel cabinet jobs; 0 means all selected cabinets",
+    )
     return parser
+
+
+def run_cabinet_job(
+    cabinet: Cabinet,
+    data_dir: Path,
+    log_dir: Path,
+    started: str,
+    date_from: str,
+    date_to: str,
+    only: str,
+    validate_only: bool,
+) -> bool:
+    db_path = cabinet_db_path(data_dir, cabinet.cabinet_id)
+    safe_cabinet_id = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in cabinet.cabinet_id)
+    log = RunLog(log_dir / f"auto_{started}_{safe_cabinet_id}_{only}_{date_from}_{date_to}.log")
+    lock_dir = Path(os.getenv("SYNC_CABINET_LOCK_DIR", "/tmp"))
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = lock_dir / f"wb_sync_cabinet_{safe_cabinet_id}.lock"
+
+    try:
+        with lock_path.open("w", encoding="utf-8") as lock_fh:
+            try:
+                fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                log.write(f"Cabinet {cabinet.cabinet_id}: another sync is already running, skipping only this cabinet")
+                return True
+
+            lock_fh.write(f"{os.getpid()} {datetime.now(ZoneInfo(TZ_NAME)).isoformat(timespec='seconds')}\n")
+            lock_fh.flush()
+
+            log.write(f"Cabinet {cabinet.cabinet_id} ({cabinet.name}), marketplace={cabinet.marketplace}, db={db_path}")
+            success = True
+
+            if only in ("all", "wb") and cabinet.marketplace in ("wb", "both"):
+                if not validate_only:
+                    success = run_wb(cabinet, db_path, date_from, date_to, log) and success
+                success = validate_wb(db_path, date_from, date_to, log, cabinet.cabinet_id) and success
+
+            if only in ("all", "ozon") and cabinet.marketplace in ("ozon", "both"):
+                if not validate_only:
+                    success = run_ozon(cabinet, db_path, date_from, date_to, log) and success
+                success = validate_ozon(db_path, date_from, date_to, log, cabinet.cabinet_id) and success
+
+            log.write(f"Cabinet {cabinet.cabinet_id} finished: " + ("OK" if success else "FAILED"))
+            return success
+    except Exception as exc:
+        log.write(f"Cabinet {cabinet.cabinet_id} crashed: {type(exc).__name__}: {exc}")
+        return False
 
 
 def main() -> int:
@@ -443,27 +509,48 @@ def main() -> int:
     started = datetime.now(ZoneInfo(TZ_NAME)).strftime("%Y%m%d_%H%M%S")
     log = RunLog(Path(args.log_dir) / f"auto_all_{started}_{args.date_from}_{args.date_to}.log")
 
-    log.write(f"Starting all-project sync: {args.date_from}..{args.date_to}, only={args.only}, validate_only={args.validate_only}")
+    log.write(
+        f"Starting all-project sync: {args.date_from}..{args.date_to}, only={args.only}, "
+        f"validate_only={args.validate_only}, stagger={args.stagger_seconds}s"
+    )
     cabinets = load_cabinets(platform_db, selected)
     if not cabinets:
         log.write("No cabinets found")
         return 1
 
-    success = True
-    for cabinet in cabinets:
-        db_path = cabinet_db_path(data_dir, cabinet.cabinet_id)
-        log.write(f"Cabinet {cabinet.cabinet_id} ({cabinet.name}), marketplace={cabinet.marketplace}, db={db_path}")
+    max_workers = args.max_workers if args.max_workers > 0 else len(cabinets)
+    max_workers = max(1, min(max_workers, len(cabinets)))
+    success_by_cabinet: dict[str, bool] = {}
+    with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
+        futures: dict[concurrent.futures.Future[bool], Cabinet] = {}
+        for idx, cabinet in enumerate(cabinets):
+            if idx and args.stagger_seconds > 0:
+                time.sleep(args.stagger_seconds)
+            log.write(f"Starting independent cabinet job: {cabinet.cabinet_id}")
+            future = executor.submit(
+                run_cabinet_job,
+                cabinet,
+                data_dir,
+                Path(args.log_dir),
+                started,
+                args.date_from,
+                args.date_to,
+                args.only,
+                args.validate_only,
+            )
+            futures[future] = cabinet
 
-        if args.only in ("all", "wb") and cabinet.marketplace in ("wb", "both"):
-            if not args.validate_only:
-                success = run_wb(cabinet, db_path, args.date_from, args.date_to, log) and success
-            success = validate_wb(db_path, args.date_from, args.date_to, log, cabinet.cabinet_id) and success
+        for future in concurrent.futures.as_completed(futures):
+            cabinet = futures[future]
+            try:
+                ok = bool(future.result())
+            except Exception as exc:
+                ok = False
+                log.write(f"Cabinet job {cabinet.cabinet_id} crashed outside worker: {type(exc).__name__}: {exc}")
+            success_by_cabinet[cabinet.cabinet_id] = ok
+            log.write(f"Cabinet job {cabinet.cabinet_id}: " + ("OK" if ok else "FAILED"))
 
-        if args.only in ("all", "ozon") and cabinet.marketplace in ("ozon", "both"):
-            if not args.validate_only:
-                success = run_ozon(cabinet, db_path, args.date_from, args.date_to, log) and success
-            success = validate_ozon(db_path, args.date_from, args.date_to, log, cabinet.cabinet_id) and success
-
+    success = all(success_by_cabinet.get(c.cabinet_id, False) for c in cabinets)
     log.write("All-project sync finished: " + ("OK" if success else "FAILED"))
     return 0 if success else 1
 
